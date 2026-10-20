@@ -4,47 +4,54 @@ An end-to-end AI platform for forecasting commodity price fluctuations and analy
 
 ---
 
-## News Intelligence Pipeline (MLOps 3 — NLP & News Intelligence)
+## Architecture & Modules (MLOps 3 — NLP & News Intelligence)
 
-This component is responsible for the automated discovery, ingestion, normalization, deduplication, and raw storage of real-time global news coverage for key commodities:
-- **Copper**
-- **Gold**
-- **Crude Oil**
-
-It queries the **GDELT DOC 2.0 API** (`https://api.gdeltproject.org/api/v2/doc/doc`) to monitor international news coverage across thousands of media outlets worldwide.
+This repository contains two core intelligence components for commodity market analysis:
+1. **News Ingestion Pipeline**: Automated discovery, ingestion, normalization, and deduplication of global commodity news (Copper, Gold, Crude Oil) from the GDELT DOC 2.0 API.
+2. **FinBERT Sentiment Analysis Pipeline**: Pretrained financial domain sentiment inference using `ProsusAI/finbert` via Hugging Face Transformers.
 
 ---
 
 ### Project Structure
 
 ```text
-├── .gitignore                      # Ignore venv, caches, raw datasets, and secrets
-├── requirements.txt                # Python dependencies
-├── run_pipeline.py                 # Convenience CLI runner
+├── .gitignore                      # Ignore venv, caches, raw/processed datasets, and secrets
+├── requirements.txt                # Python dependencies (requests, pytest, torch, transformers)
+├── run_pipeline.py                 # News ingestion CLI runner
+├── run_sentiment.py                # Sentiment analysis CLI runner
 ├── data/
-│   └── raw/
-│       ├── .gitkeep                # Keeps raw directory tracked in git
-│       └── commodity_news.jsonl    # Ingested news records (JSON Lines, git-ignored)
+│   ├── raw/
+│   │   ├── .gitkeep                # Tracks directory in git
+│   │   └── commodity_news.jsonl    # Raw ingested news records (JSON Lines, git-ignored)
+│   └── processed/
+│       ├── .gitkeep                # Tracks directory in git
+│       └── commodity_news_sentiment.jsonl # Enriched sentiment records (JSON Lines, git-ignored)
 ├── src/
 │   ├── __init__.py
-│   └── news_intelligence/
+│   ├── news_intelligence/          # News ingestion module
+│   │   ├── __init__.py             # Public module interface
+│   │   ├── config.py               # Ingestion configuration and commodity queries
+│   │   ├── gdelt_client.py         # GDELT DOC 2.0 client (rate-limiting & retries)
+│   │   ├── normalizer.py           # Field normalization & timestamp parsing
+│   │   ├── storage.py              # JSONL persistence & (commodity, url) deduplication
+│   │   └── pipeline.py             # Pipeline orchestrator & CLI
+│   └── sentiment/                  # Sentiment analysis module
 │       ├── __init__.py             # Public module interface
-│       ├── config.py               # Pipeline configuration and commodity queries
-│       ├── gdelt_client.py         # GDELT DOC 2.0 client (rate-limiting & retries)
-│       ├── normalizer.py           # Field normalization & timestamp parsing
-│       ├── storage.py              # JSONL persistence & (commodity, url) deduplication
-│       └── pipeline.py             # Pipeline orchestrator & CLI
+│       ├── config.py               # Sentiment configuration & compute device settings
+│       ├── analyzer.py             # FinBERT analyzer (lazy loading, batching, safe fallbacks)
+│       └── pipeline.py             # Sentiment pipeline orchestrator & CLI
 └── tests/
     ├── __init__.py
     ├── test_client.py              # Unit tests for GDELTClient (mocked HTTP/network)
     ├── test_normalizer.py          # Unit tests for schema normalization
     ├── test_storage.py             # Unit tests for deduplication & JSONL storage
-    └── test_pipeline.py            # End-to-end pipeline tests (mocked offline)
+    ├── test_pipeline.py            # End-to-end news pipeline tests (mocked offline)
+    └── test_sentiment.py           # Unit tests for FinBERT sentiment (mocked offline)
 ```
 
 ---
 
-### Installation
+### Installation & Environment Setup
 
 1. **Prerequisites**: Python 3.10+ (tested on Python 3.14).
 2. **Clone the repository and checkout the feature branch**:
@@ -69,26 +76,20 @@ It queries the **GDELT DOC 2.0 API** (`https://api.gdeltproject.org/api/v2/doc/d
 
 ---
 
-### Running the Pipeline
+### 1. Running the News Ingestion Pipeline
 
-You can run the pipeline directly via the root runner or as a Python module:
+Ingests articles for **Copper**, **Gold**, and **Crude Oil** from GDELT DOC 2.0 and saves them to `data/raw/commodity_news.jsonl`.
 
-#### 1. Basic Ingestion (Default Commodities: Copper, Gold, Crude Oil)
+#### Basic Ingestion
 ```bash
 python run_pipeline.py
 ```
-Or:
+Or as a module:
 ```bash
 python -m src.news_intelligence.pipeline
 ```
 
-#### 2. Advanced Options & Customization
-Use command-line flags to adjust commodities, number of records, timespan window, or rate limit:
-```bash
-python run_pipeline.py --commodities "copper,gold,crude oil" --max-records 10 --timespan 7d --verbose
-```
-
-Available CLI arguments:
+#### Ingestion CLI Arguments
 | Flag | Default | Description |
 |---|---|---|
 | `--commodities` | `copper,gold,crude oil` | Comma-separated list of commodities to fetch |
@@ -100,25 +101,47 @@ Available CLI arguments:
 
 ---
 
-### Output Data Schema
+### 2. Running FinBERT Sentiment Analysis
 
-Records are saved to `data/raw/commodity_news.jsonl` formatted as **JSON Lines** (one valid JSON object per line, UTF-8 encoded).
+Enriches existing raw news records with financial sentiment classifications using `ProsusAI/finbert`.
+Reads from `data/raw/commodity_news.jsonl` and writes enriched records to `data/processed/commodity_news_sentiment.jsonl`. **Never modifies or overwrites raw data.**
 
-Each record follows this normalized schema:
+#### Basic Sentiment Run
+```bash
+python run_sentiment.py
+```
+Or as a module:
+```bash
+python -m src.sentiment.pipeline
+```
 
-| Field Name | Type | Description | Example |
-|---|---|---|---|
-| `commodity` | string | Target commodity name (lowercase) | `"copper"` |
-| `title` | string | Article headline (stripped string) | `"Copper rallies as supply tightens"` |
-| `url` | string | Article web address (unique per commodity) | `"https://reuters.com/markets/copper123"` |
-| `publication_timestamp` | string \| null | Standardized ISO 8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) or `null` if unavailable | `"2026-10-15T12:00:00Z"` |
-| `domain` | string | Clean domain of the publisher | `"reuters.com"` |
-| `language` | string | Publisher language | `"English"` |
-| `source_country` | string \| null | Country of the news source or `null` if unlisted | `"United States"` |
-| `fetch_timestamp` | string | Standardized ISO 8601 UTC timestamp when ingested | `"2026-10-20T13:11:20Z"` |
-| `provider` | string | Data source provider identifier | `"gdelt"` |
+#### Sentiment CLI Arguments
+| Flag | Default | Description |
+|---|---|---|
+| `--input` | `data/raw/commodity_news.jsonl` | Source raw news JSONL file path |
+| `--output` | `data/processed/commodity_news_sentiment.jsonl` | Destination processed JSONL file path |
+| `--model-name` | `ProsusAI/finbert` | Hugging Face model repository identifier |
+| `--batch-size` | `16` | Inference batch size |
+| `--device` | Auto-detect | Compute device (`cpu` or `cuda`) |
+| `--verbose` | `False` | Enable debug logging to stdout |
 
-#### Sample Record:
+---
+
+### Hardware, CPU/GPU & First-time Model Download
+
+- **First-Time Download**: On its first live execution, `transformers` will download the `ProsusAI/finbert` model weights (~440 MB) from the Hugging Face Hub. Files are cached locally in `~/.cache/huggingface/hub/` and reused across subsequent executions.
+- **Hardware Acceleration**:
+  - The pipeline automatically detects whether an NVIDIA GPU with CUDA is available (`torch.cuda.is_available()`).
+  - If a GPU is present, inference runs on device `cuda:0` for maximum throughput.
+  - If no GPU is available, inference transparently defaults to `cpu`.
+- **Memory Safety & Batching**: Text inputs are processed in chunks of 16 (configurable via `--batch-size`) with sequence truncation capped at 512 tokens to prevent out-of-memory (OOM) errors.
+- **Offline / Test Independence**: Unit tests use mock pipelines and **never** trigger model downloads or internet requests.
+
+---
+
+### Data Schemas
+
+#### A. Raw News Record (`data/raw/commodity_news.jsonl`)
 ```json
 {
   "commodity": "copper",
@@ -133,47 +156,77 @@ Each record follows this normalized schema:
 }
 ```
 
+#### B. Processed Sentiment Record (`data/processed/commodity_news_sentiment.jsonl`)
+Preserves all original fields and appends 4 normalized sentiment fields:
+
+```json
+{
+  "commodity": "copper",
+  "title": "Bimetals : Copper Next Frontier",
+  "url": "http://www.prnewswire.com/news-releases/bimetals-coppers-next-frontier-302910564.html",
+  "publication_timestamp": "2026-10-15T20:15:00Z",
+  "domain": "prnewswire.com",
+  "language": "English",
+  "source_country": "United States",
+  "fetch_timestamp": "2026-10-20T13:11:20Z",
+  "provider": "gdelt",
+  "sentiment_label": "neutral",
+  "sentiment_score": 0.8914,
+  "sentiment_model": "ProsusAI/finbert",
+  "sentiment_status": "success"
+}
+```
+
+#### Sentiment Fields Description:
+| Field Name | Type | Allowed Values / Description |
+|---|---|---|
+| `sentiment_label` | string | `'positive'`, `'negative'`, `'neutral'`, or `'unavailable'` |
+| `sentiment_score` | float \| null | Model prediction confidence score between 0.0 and 1.0 (e.g. `0.9543`), or `null` if unavailable |
+| `sentiment_model` | string | Identifier of the model used (`"ProsusAI/finbert"`) |
+| `sentiment_status` | string | Execution outcome: `'success'`, `'empty_text'`, or error description |
+
 ---
 
-### Deduplication Strategy
+### Modular Sentiment API Usage
 
-- Deduplication uses a composite key: `(commodity, url)`.
-- **Cross-run persistence**: On every run, existing keys in `data/raw/commodity_news.jsonl` are pre-loaded into an in-memory set in `O(N)` time.
-- **In-batch deduplication**: Articles within the same fetch batch sharing the same `(commodity, url)` are automatically skipped.
-- **Cross-commodity flexibility**: If an article discusses both Gold and Copper, it is legitimately retained under both commodities because the key includes `commodity`.
+The sentiment module is decoupled and can be imported directly into future services or feature engineering pipelines:
 
----
+```python
+from src.sentiment import FinBERTSentimentAnalyzer
 
-### Resilience & Error Handling
+analyzer = FinBERTSentimentAnalyzer()
 
-1. **GDELT Rate Limits (HTTP 429)**: GDELT enforces a policy requiring at least 5 seconds between consecutive requests. The pipeline features built-in delay spacing (`5.5s`) and exponential backoff (`6s`, `12s`, `18s`) if an HTTP 429 is encountered.
-2. **Transient Failures (HTTP 5xx, Timeouts)**: Automatically retried up to 3 times before declaring a query failed.
-3. **Malformed Responses**: Safely handles non-JSON HTML error responses and GDELT text messages ("no matching articles").
-4. **Missing Fields**: Safely parses missing or malformed dates, country codes, or titles without crashing. Records lacking a URL are rejected.
-5. **Partial Failures**: If one commodity query fails (e.g. rate limit exhausted or network timeout), the pipeline logs the error for that commodity and safely proceeds to ingest the remaining commodities.
+# Analyze a single headline:
+result = analyzer.analyze_text("Gold prices rally sharply as dollar softens")
+print(result)
+# Output: {'sentiment_label': 'positive', 'sentiment_score': 0.9543, 'sentiment_model': 'ProsusAI/finbert', 'sentiment_status': 'success'}
+
+# Analyze an existing dictionary:
+record = {"commodity": "gold", "title": "Fed holds rates steady"}
+enriched = analyzer.enrich_record(record)
+```
 
 ---
 
 ### Running Tests
 
-All unit and integration tests use mocked network responses. **Tests execute completely offline without requiring an internet connection or calling the live GDELT API.**
+All unit and integration tests run **100% offline with zero external network or model download requirements**:
 
-Run the test suite:
 ```bash
 python -m pytest -v
 ```
 
 Test coverage includes:
-- `test_client.py`: HTTP 200 parsing, HTTP 429 backoff/retries, HTTP 5xx retry, fatal 404, timeouts, connection errors, corrupted JSON, and empty responses.
-- `test_normalizer.py`: Date format parsing (`YYYYMMDDTHHMMSSZ`, digits only, ISO), missing URL rejection, whitespace cleaning, domain fallback, and null field handling.
-- `test_storage.py`: Directory creation, JSONL formatting, in-batch deduplication, cross-run deduplication, and corrupt line recovery.
-- `test_pipeline.py`: End-to-end pipeline execution across all 3 commodities, partial failure isolation, and duplicate skip tracking.
+- **`test_client.py`**: GDELT client retries, HTTP 429 backoff, 5xx handling, timeouts, malformed responses.
+- **`test_normalizer.py`**: Date conversions, missing URLs, schema standardizations.
+- **`test_storage.py`**: JSONL appending, directory creation, cross-run deduplication.
+- **`test_pipeline.py`**: End-to-end news ingestion orchestration and partial failure handling.
+- **`test_sentiment.py`**: FinBERT classification for positive/negative/neutral labels, empty/whitespace handling, batch inference, model loading error recovery, and end-to-end enrichment without modifying raw files.
 
 ---
 
-### Limitations of GDELT DOC 2.0 API
+### Limitations
 
-1. **Strict Rate Limits**: GDELT DOC 2.0 allows only 1 request every 5 seconds per IP address. Rapid sequential requests from multiple threads or scripts will trigger HTTP 429 errors.
-2. **Metadata Discovery Only**: GDELT returns discovery metadata (headline, URL, language, country, date), not full article body text. Downstream NLP tasks (full-text sentiment, event extraction) will require a secondary page fetcher or scraping step.
-3. **Timestamp Granularity**: GDELT's `seendate` reflects the timestamp when GDELT indexed the article, which can occasionally lag the real publication time by minutes or hours.
-4. **Multi-language Ingestion**: GDELT crawls articles in over 100 languages. Downstream NLP components should incorporate multilingual models or language-based filtering.
+1. **Headline vs. Full Article Text**: The sentiment model currently analyzes article headlines. While headlines are strong indicators for high-frequency price movement, subtle nuances in long-form articles require full-body text extraction.
+2. **Language Coverage**: `ProsusAI/finbert` is pretrained on English financial texts (Financial PhraseBank). For non-English news headlines, predictions typically classify as neutral or have lower reliability unless pre-translated.
+3. **GDELT Rate Limits**: The upstream news ingestion relies on GDELT DOC 2.0, which enforces a strict 1 request every 5 seconds per IP limit.
