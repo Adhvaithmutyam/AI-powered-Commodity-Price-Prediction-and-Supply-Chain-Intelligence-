@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from .config import PipelineConfig
 from .gdelt_client import GDELTClient, GDELTClientError
 from .normalizer import normalize_article
+from .relevance import enrich_record_with_relevance
 from .storage import append_records, load_existing_keys
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class NewsIngestionPipeline:
         max_records: Optional[int] = None,
         timespan: Optional[str] = None,
         output_path: Optional[Path] = None,
+        assess_relevance: bool = False,
     ) -> Dict[str, Any]:
         """
         Execute the news ingestion pipeline for specified commodities.
@@ -45,6 +47,7 @@ class NewsIngestionPipeline:
             max_records: Maximum records to request per commodity.
             timespan: Timespan window (e.g., '24h', '7d').
             output_path: Destination .jsonl path.
+            assess_relevance: If True, enriches records with explainable relevance classification.
 
         Returns:
             Dictionary summary of the pipeline execution run.
@@ -55,9 +58,10 @@ class NewsIngestionPipeline:
         time_window = timespan or self.config.timespan
 
         logger.info(
-            "Starting News Ingestion Pipeline for %d commodities: %s",
+            "Starting News Ingestion Pipeline for %d commodities: %s (assess_relevance=%s)",
             len(target_commodities),
             target_commodities,
+            assess_relevance,
         )
 
         # Pre-load existing (commodity, url) keys to ensure deduplication
@@ -74,6 +78,14 @@ class NewsIngestionPipeline:
             "errors": {},
             "success": True,
         }
+
+        if assess_relevance:
+            summary["relevance_counts"] = {
+                "directly_relevant": 0,
+                "potentially_relevant": 0,
+                "irrelevant": 0,
+                "uncertain": 0,
+            }
 
         fetch_batch_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -114,6 +126,12 @@ class NewsIngestionPipeline:
                     fetch_timestamp=fetch_batch_timestamp,
                 )
                 if norm_record:
+                    if assess_relevance:
+                        norm_record = enrich_record_with_relevance(norm_record)
+                        rel_class = norm_record.get("relevance_class", "uncertain")
+                        summary["relevance_counts"][rel_class] = (
+                            summary["relevance_counts"].get(rel_class, 0) + 1
+                        )
                     normalized_records.append(norm_record)
 
             # Deduplicate and save
@@ -180,8 +198,13 @@ def main() -> None:
     parser.add_argument(
         "--rate-limit-delay",
         type=float,
-        default=5.5,
-        help="Delay in seconds between GDELT API calls (default: 5.5)",
+        default=6.0,
+        help="Delay in seconds between GDELT API calls (default: 6.0)",
+    )
+    parser.add_argument(
+        "--assess-relevance",
+        action="store_true",
+        help="Enrich ingested records with explainable relevance classification",
     )
     parser.add_argument(
         "--verbose",
@@ -214,6 +237,7 @@ def main() -> None:
         max_records=args.max_records,
         timespan=args.timespan,
         output_path=Path(args.output),
+        assess_relevance=args.assess_relevance,
     )
 
     print("\n--- Pipeline Execution Summary ---")
@@ -227,6 +251,11 @@ def main() -> None:
             print(f"  [{comm}] ERROR: {stats['error']}")
         else:
             print(f"  [{comm}] Fetched: {stats['fetched']}, Saved: {stats['saved']}, Duplicates: {stats['duplicates']}")
+
+    if "relevance_counts" in result:
+        print("\nRelevance Breakdown:")
+        for r_class, count in result["relevance_counts"].items():
+            print(f"  {r_class}: {count}")
 
     if result["errors"]:
         print("\nWarnings / Errors encountered:")

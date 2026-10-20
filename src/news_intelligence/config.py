@@ -9,7 +9,7 @@ from typing import Dict, List
 
 @dataclass
 class PipelineConfig:
-    """Configuration settings for GDELT news ingestion."""
+    """Configuration settings for GDELT news ingestion and relevance filtering."""
 
     # Target commodities to collect news for
     commodities: List[str] = field(
@@ -17,12 +17,13 @@ class PipelineConfig:
     )
 
     # Search queries tailored per commodity
-    # For multi-word phrases like 'crude oil', quotation marks ensure exact phrase matching in GDELT.
+    # Targeted queries use domain operational terms, negative keywords (e.g. -sports),
+    # exact phrases, and sourcelang:english to eliminate noise and non-English homonyms.
     commodity_queries: Dict[str, str] = field(
         default_factory=lambda: {
-            "copper": "copper",
-            "gold": "gold",
-            "crude oil": '"crude oil"',
+            "copper": 'copper (mining OR mine OR smelter OR cathode OR LME OR inventories OR strike OR "copper price") sourcelang:english',
+            "gold": 'gold ("gold price" OR bullion OR "central bank" OR reserves OR "gold mining" OR "gold futures") -olympic -"gold medal" -sports sourcelang:english',
+            "crude oil": '"crude oil" (OPEC OR production OR barrels OR refinery OR inventories OR EIA OR sanctions OR "oil price") sourcelang:english',
         }
     )
 
@@ -43,7 +44,7 @@ class PipelineConfig:
 
     # Network, retry, and rate-limiting settings
     timeout_seconds: int = 30
-    rate_limit_delay_seconds: float = 5.5  # GDELT requires at least 5s between requests
+    rate_limit_delay_seconds: float = 6.0  # GDELT enforces at least 5s between requests
     max_retries: int = 3
-    retry_backoff_seconds: float = 6.0
+    retry_backoff_seconds: float = 8.0
     user_agent: str = "CommodityNewsIntelligence/1.0 (Python/Requests)"

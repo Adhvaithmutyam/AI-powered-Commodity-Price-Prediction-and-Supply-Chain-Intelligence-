@@ -6,10 +6,11 @@ An end-to-end AI platform for forecasting commodity price fluctuations and analy
 
 ## Architecture & Modules (MLOps 3 — NLP & News Intelligence)
 
-This repository contains three decoupled intelligence components for commodity market analysis:
-1. **News Ingestion Pipeline**: Automated discovery, ingestion, normalization, and deduplication of global commodity news (Copper, Gold, Crude Oil) from the GDELT DOC 2.0 API.
+This repository contains decoupled, production-grade intelligence components for commodity market analysis:
+1. **News Ingestion & Relevance Pipeline**: Automated discovery, targeted search query construction, schema normalization, deduplication, and explainable relevance classification of global commodity news (Copper, Gold, Crude Oil) from the GDELT DOC 2.0 API.
 2. **FinBERT Sentiment Analysis Pipeline**: Pretrained financial domain sentiment inference using `ProsusAI/finbert` via Hugging Face Transformers.
-3. **Supply-Chain Event Extraction Pipeline**: Domain-specific extraction of operational disruptions, demand shocks, geopolitical risks, and inventory movements with explainable market implications.
+3. **Supply-Chain Event Extraction Pipeline**: Domain-specific rule-based extraction of operational disruptions, demand shocks, geopolitical risks, policy actions, and inventory movements with explainable market implications.
+4. **Relevance Assessment & Pipeline Evaluation**: Transparent relevance classification into `directly_relevant`, `potentially_relevant` (macro drivers), `irrelevant` (sports, noise, slang), and `uncertain` (boilerplate, uninformative).
 
 ---
 
@@ -21,6 +22,7 @@ This repository contains three decoupled intelligence components for commodity m
 ├── run_pipeline.py                 # News ingestion CLI runner
 ├── run_sentiment.py                # Sentiment analysis CLI runner
 ├── run_event_extraction.py         # Event extraction CLI runner
+├── run_relevance_eval.py           # Relevance evaluation CLI runner
 ├── data/
 │   ├── raw/
 │   │   ├── .gitkeep                # Tracks directory in git
@@ -31,11 +33,12 @@ This repository contains three decoupled intelligence components for commodity m
 │       └── commodity_events.jsonl         # Extracted supply-chain events (JSON Lines, git-ignored)
 ├── src/
 │   ├── __init__.py
-│   ├── news_intelligence/          # News ingestion module
+│   ├── news_intelligence/          # News ingestion & relevance module
 │   │   ├── __init__.py             # Public module interface
-│   │   ├── config.py               # Ingestion configuration and commodity queries
+│   │   ├── config.py               # Ingestion configuration & targeted commodity queries
 │   │   ├── gdelt_client.py         # GDELT DOC 2.0 client (rate-limiting & retries)
 │   │   ├── normalizer.py           # Field normalization & timestamp parsing
+│   │   ├── relevance.py            # Explainable relevance classifier & taxonomy
 │   │   ├── storage.py              # JSONL persistence & (commodity, url) deduplication
 │   │   └── pipeline.py             # Pipeline orchestrator & CLI
 │   ├── sentiment/                  # Sentiment analysis module
@@ -56,6 +59,7 @@ This repository contains three decoupled intelligence components for commodity m
     ├── test_normalizer.py          # Unit tests for schema normalization
     ├── test_storage.py             # Unit tests for deduplication & JSONL storage
     ├── test_pipeline.py            # End-to-end news pipeline tests (mocked offline)
+    ├── test_relevance.py           # Unit tests for news relevance & query syntax (mocked offline)
     ├── test_sentiment.py           # Unit tests for FinBERT sentiment (mocked offline)
     └── test_event_extraction.py    # Unit tests for supply-chain event extraction (mocked offline)
 ```
@@ -90,32 +94,32 @@ This repository contains three decoupled intelligence components for commodity m
 ### Execution Commands
 
 #### 1. Ingest Raw Commodity News
-Queries GDELT DOC 2.0 for copper, gold, and crude oil:
+Queries GDELT DOC 2.0 with targeted queries for copper, gold, and crude oil:
 ```bash
 python run_pipeline.py
 ```
+*Optional Flag:* `--assess-relevance` appends explainable relevance evaluation to ingested records.
 *Output: `data/raw/commodity_news.jsonl`*
 
-#### 2. Run FinBERT Sentiment Analysis
-Enriches raw news records with financial sentiment (`positive`, `negative`, `neutral`):
+#### 2. Evaluate News Relevance
+Evaluates ingested records against operational and macroeconomic signals:
+```bash
+python run_relevance_eval.py --input data/raw/commodity_news.jsonl
+```
+
+#### 3. Run FinBERT Sentiment Analysis
+Enriches news records with financial sentiment (`positive`, `negative`, `neutral`):
 ```bash
 python run_sentiment.py
 ```
 *Output: `data/processed/commodity_news_sentiment.jsonl`*
 
-#### 3. Run Supply-Chain Event Extraction
+#### 4. Run Supply-Chain Event Extraction
 Extracts concrete supply-chain events and evaluates potential market impacts:
 ```bash
 python run_event_extraction.py
 ```
 *Output: `data/processed/commodity_events.jsonl`*
-
-#### Event Extraction CLI Arguments:
-| Flag | Default | Description |
-|---|---|---|
-| `--input` | `data/processed/commodity_news_sentiment.jsonl` | Source file path (falls back to `data/raw/commodity_news.jsonl` if sentiment has not run) |
-| `--output` | `data/processed/commodity_events.jsonl` | Output file path for extracted events |
-| `--verbose` | `False` | Enable detailed debug logs |
 
 ---
 
@@ -136,7 +140,26 @@ python run_event_extraction.py
 }
 ```
 
-#### B. Processed Sentiment Schema (`data/processed/commodity_news_sentiment.jsonl`)
+#### B. Relevance-Enriched Schema (Optional via `--assess-relevance`)
+```json
+{
+  "commodity": "copper",
+  "title": "Chilean copper mine strike threatens global supply",
+  "url": "https://reuters.com/copper-strike",
+  "publication_timestamp": "2026-10-20T10:00:00Z",
+  "domain": "reuters.com",
+  "language": "English",
+  "source_country": "Chile",
+  "fetch_timestamp": "2026-10-20T11:00:00Z",
+  "provider": "gdelt",
+  "relevance_class": "directly_relevant",
+  "relevance_score": 0.88,
+  "relevance_explanation": "Headline explicitly references target commodity and operational/market signals (mining_production, supply_disruption). Assessment based on headline analysis; full article text was not analyzed.",
+  "matched_indicators": ["commodity_copper", "mining_production", "supply_disruption"]
+}
+```
+
+#### C. Processed Sentiment Schema (`data/processed/commodity_news_sentiment.jsonl`)
 ```json
 {
   "commodity": "copper",
@@ -155,7 +178,7 @@ python run_event_extraction.py
 }
 ```
 
-#### C. Extracted Supply-Chain Event Schema (`data/processed/commodity_events.jsonl`)
+#### D. Extracted Supply-Chain Event Schema (`data/processed/commodity_events.jsonl`)
 ```json
 {
   "commodity": "copper",
@@ -171,54 +194,55 @@ python run_event_extraction.py
 }
 ```
 
-#### Event Fields Description:
-| Field Name | Type | Description |
-|---|---|---|
-| `commodity` | string | Target commodity (`copper`, `gold`, `crude oil`, or `unknown`) |
-| `event_type` | string | One of the 7 supported event classifications |
-| `event_summary` | string | Factual summary derived directly from the reported article headline |
-| `impact_direction` | string | Hypothetical market direction: `'potentially_bullish'`, `'potentially_bearish'`, `'mixed'`, or `'unknown'` |
-| `confidence` | float | Classification confidence score between `0.0` and `1.0` |
-| `evidence_url` | string | Verifiable URL link to the original article source (never fabricated) |
-| `article_publication_timestamp` | string \| null | Publication timestamp preserved from source article |
-| `extraction_status` | string | Outcome status: `'success'`, `'unclassified'`, `'insufficient_data'`, or `'error'` |
-| `evidence_fact` | string \| null | Matched factual keywords/phrases extracted from text |
-| `implication_rationale` | string \| null | Economic reasoning explaining the directional hypothesis |
-
 ---
 
-### Key Architectural Principles
+### News Relevance & Query Engineering (Task 4)
 
-1. **Non-Destructive Processing**: Raw datasets (`data/raw/`) and intermediate sentiment datasets are treated as read-only. Processed events are persisted into a dedicated destination file (`data/processed/commodity_events.jsonl`).
-2. **Facts vs. Implications**: A reported factual event (e.g., a mine strike) is recorded as a factual occurrence; the market impact (`potentially_bullish`) is explicitly labeled as a potential economic hypothesis, acknowledging that market implications are not proven causal guarantees.
-3. **Zero Hallucination**: If article text is empty, missing, or ambiguous, the pipeline assigns `event_type: "other"`, `impact_direction: "unknown"`, and `extraction_status: "insufficient_data"`. URLs, publication dates, and event facts are never invented.
-4. **Sentiment Independence**: The event classifier evaluates operational and economic supply-chain dynamics rather than relying on sentiment scores. (For example, an accident shutting down a refinery may have negative news sentiment, but represents a bullish supply shock for the refined product.)
-5. **Negation & False-Positive Handling**: Headlines negating disruptions (e.g. *"mine strike avoided"*, *"cuts ruled out"*) or containing irrelevant contexts (e.g. sports *"gold medal"*, *"crude joke"*) are filtered and classified as `other` with `unknown` impact.
-6. **Commodity-Specific Nuance**: Geopolitical conflict, interest rate changes, and production quotas are evaluated in relation to the specific target commodity rather than applying a blanket bullish/bearish label.
-7. **Extensibility for LLMs**: Built around `BaseEventExtractor`. A local open-source LLM extractor can be dropped in simply by subclassing `BaseEventExtractor` without changing pipelines or downstream consumers.
+#### 1. Diagnosis of Initial News Records
+An audit of the initial 15 live records ingested via GDELT revealed why **100%** were classified as `other` in the event-extraction stage:
+- **Foreign-Language Noise & Homonyms (73.3%)**: Because initial queries were single-word keywords (`copper`, `gold`, `"crude oil"`) without language constraints, GDELT returned articles in 9 different languages. For copper, GDELT matched Vietnamese articles mentioning `đồng` (Vietnamese currency and homonym), Russian regional athletes, French DIY insulation, and Romanian jokes.
+- **Unrelated Keyword Matches (26.7%)**: For gold and crude oil, broad matching pulled event venue rentals (*"New Venues in Boston for Fall 2026 Meetings and Events"*) and generic corporate analyst stock ratings without operational context.
+- **Extractor Integrity**: The downstream event extractor correctly classified these records as `other` / `unknown` rather than hallucinating fictitious supply disruptions from non-English text or venue announcements.
+
+#### 2. Improved GDELT DOC 2.0 Query Construction
+To eliminate noise, search queries in `src/news_intelligence/config.py` were upgraded to combine domain terms, negative filters, exact phrases, and English language tags:
+- **Copper**:
+  `copper (mining OR mine OR smelter OR cathode OR LME OR inventories OR strike OR "copper price") sourcelang:english`
+- **Gold**:
+  `gold ("gold price" OR bullion OR "central bank" OR reserves OR "gold mining" OR "gold futures") -olympic -"gold medal" -sports sourcelang:english`
+- **Crude Oil**:
+  `"crude oil" (OPEC OR production OR barrels OR refinery OR inventories OR EIA OR sanctions OR "oil price") sourcelang:english`
+
+#### 3. Relevance Taxonomy
+Articles are categorized into four transparent classes:
+1. `directly_relevant` (Score: 0.80–1.00): Explicitly mentions the target commodity alongside operational, supply-chain, or price indicators (smelter cuts, mine strikes, OPEC quotas, bullion buying).
+2. `potentially_relevant` (Score: 0.60–0.80): Captures macroeconomic and cross-market price drivers (Federal Reserve interest rate decisions, inflation CPI/PPI, global manufacturing PMI, US Dollar Index/DXY, trade tariffs) that materially move commodity markets even when the commodity name is omitted.
+3. `irrelevant` (Score: 0.00–0.20): Filters false-positive homonyms (sports *"gold medal"*, idiomatic *"crude joke"*, domestic *"copper pipes"*, foreign currency *"đồng"*, unrelated venue announcements).
+4. `uncertain` (Score: 0.40–0.50): Assigned to empty headlines, uninformative boilerplates (*"Press Release"*), or non-English text lacking domain context.
 
 ---
 
 ### Running Tests
 
-All 61 unit and integration tests run **100% offline with zero external network or model download requirements**:
+All **80 unit and integration tests** run **100% offline with zero external network or model download requirements**:
 
 ```bash
 python -m pytest -v
 ```
 
-Test coverage:
-- **`test_client.py` (10 tests)**: GDELT API rate-limiting, backoff, HTTP 429/5xx, network timeouts.
+Test coverage breakdown:
+- **`test_client.py` (10 tests)**: GDELT API rate-limiting, exponential backoff, HTTP 429/5xx, timeouts.
 - **`test_normalizer.py` (10 tests)**: Schema normalization, date parsing, URL validation.
 - **`test_storage.py` (5 tests)**: JSONL persistence and `(commodity, url)` deduplication.
-- **`test_pipeline.py` (4 tests)**: End-to-end ingestion and partial failure recovery.
+- **`test_pipeline.py` (4 tests)**: End-to-end news pipeline tests and partial failure recovery.
+- **`test_relevance.py` (19 tests)**: Direct commodity operational headlines, macroeconomic drivers (Fed rate cuts, CPI, PMI, DXY), sports/slang noise filtering, edge cases (empty/boilerplate), schema preservation, and pipeline relevance integration.
 - **`test_sentiment.py` (10 tests)**: FinBERT classification, lazy loading, batching, and error handling.
-- **`test_event_extraction.py` (22 tests)**: Major event types, negation statements, sports/slang filtering, commodity-specific geopolitical/policy nuance, missing/null URLs and timestamps, exact schema preservation, and non-destructive storage.
+- **`test_event_extraction.py` (22 tests)**: Major event types, negation handling, commodity-specific geopolitical/policy nuance, missing URLs/timestamps, and non-destructive storage.
 
 ---
 
-### Limitations
+### Limitations & Production Considerations
 
-1. **Rule-based Linguistic Scope**: The current rule-based extractor uses high-precision regex patterns tailored for English news headlines. Highly idiomatic, metaphorical, or non-English expressions are conservatively categorized as `other` / `unknown`.
-2. **Headlines vs. Full Articles**: Event extraction currently operates on article headlines. Nuanced multi-event stories or secondary clauses located within article bodies will benefit from full-text crawling in future milestones.
-3. **Market Complexity**: Potential market directions are first-order economic implications and do not account for broader macro regimes, inventory buffers, or offsetting shocks.
+1. **GDELT Rate Limits**: The GDELT DOC 2.0 API enforces a strict rate limit of at most 1 request every 5 seconds per client IP. The pipeline defaults to `rate_limit_delay_seconds = 6.0` and exponential backoff (`retry_backoff_seconds = 8.0`) to avoid tripping HTTP 429 penalties.
+2. **Headline-Only Analysis**: GDELT DOC 2.0 returns article titles and URLs, not full body text. All relevance assessments and event extractions explicitly acknowledge that analysis is performed on headlines and metadata.
+3. **Macroeconomic Attribution**: Broad macroeconomic events (e.g. Fed rate cuts or manufacturing PMI) are classified as `potentially_relevant` because their price transmission mechanisms across commodities are mediated by market expectations.
