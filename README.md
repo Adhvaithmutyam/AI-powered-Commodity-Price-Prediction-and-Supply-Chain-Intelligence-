@@ -166,7 +166,8 @@ This repository is under active development. The table below delineates complete
 | **Explainable News Relevance Filter** | MLOps 3 | ✅ **Implemented & Committed** | 4-way taxonomy, indicator extraction, noise filtering (`src/news_intelligence/relevance.py`). |
 | **FinBERT Sentiment Analysis** | MLOps 3 | ✅ **Implemented & Committed** | Hugging Face Transformers integration, batching, lazy loading (`src/sentiment/`). |
 | **Supply-Chain Event Extraction** | MLOps 3 | ✅ **Implemented & Committed** | 7 event classes, negation detection, economic impact rules (`src/event_extraction/`). |
-| **Standardized NLP Feature Engineering** | MLOps 3 | ⏳ **Implemented (Local / Audit)** | Multi-source joining, point-in-time window aggregator, leakage filtering (`src/features/`, `run_features.py`). |
+| **Standardized NLP Feature Engineering** | MLOps 3 | ✅ **Implemented & Committed** | Multi-source joining, point-in-time window aggregator, leakage filtering (`src/features/`, `run_features.py`). |
+| **NLP Evaluation & Data-Quality Validation** | MLOps 3 | ✅ **Implemented (Local)** | Data-quality audits, bias-free annotation sampler, multi-class classification metrics (`src/evaluation/`, `run_evaluation.py`). |
 | **Price Data Ingestion & Validation** | MLOps 1 | 📋 **Planned** | Historical OHLCV ingestion pipelines and schema validation. |
 | **Predictive Price Models (T+1, T+5)** | MLOps 2 | 📋 **Planned** | Baseline models, feature importance, and machine learning forecasters. |
 | **Frontend Web Dashboard** | Web 1 | 📋 **Planned** | Interactive charts, risk heatmaps, and sentiment feeds. |
@@ -279,6 +280,25 @@ python run_features.py --cutoff 2026-10-20T12:00:00Z --windows 1,5
 - `data/processed/nlp_article_features.jsonl` (article-level features)
 - `data/processed/nlp_aggregated_features.jsonl` (windowed rolling features)
 
+### 6. Run NLP Evaluation & Data-Quality Validation
+Executes data quality audits, generates unbiased human annotation sample templates, or evaluates model predictions against human ground truth:
+```bash
+# A. Audit data quality of article-level features
+python run_evaluation.py --mode validate
+
+# B. Generate a reproducible, bias-free human annotation template
+python run_evaluation.py --mode sample --sample-size 50 --seed 42
+
+# C. Evaluate pipeline predictions against human-labeled ground truth
+python run_evaluation.py --mode evaluate --ground-truth data/evaluation/ground_truth.jsonl
+```
+*Optional Flags:*
+- `--input <PATH>`: Custom input JSONL file path (defaults to article features).
+- `--output <PATH>`: Output report JSON or sample template JSONL path.
+- `--cutoff <ISO_TIMESTAMP>`: Evaluation cutoff timestamp to detect future-dated articles.
+- `--sample-size <N>`: Number of records to extract for annotation (default: 50).
+- `--seed <INT>`: Random seed for deterministic sampling (default: 42).
+
 ---
 
 ## 13. Testing & Quality Assurance
@@ -299,8 +319,9 @@ python -m pytest -v
 - **`tests/test_sentiment.py` (10 tests)**: Tests FinBERT output mapping, batch inference, lazy model initialization, and malformed text fallback.
 - **`tests/test_event_extraction.py` (22 tests)**: Validates event classification across all 7 taxonomy classes, negation detection (e.g., "strike averted"), commodity-specific geopolitical rules, and missing data handling.
 - **`tests/test_features.py` (23 tests)**: Verifies multi-source record joining, partial sentiment merge preservation, sentiment-only/event-only coexistence, multi-commodity identity retention, null-safe matched indicators, URL canonicalization, UTC timestamp normalization, exact window boundary inclusion/exclusion, strict future leakage filtering, unanchored timestamp handling, confidence mean vs. polarity calculations, relevant-only sentiment isolation, cutoff auditing, and pipeline execution.
+- **`tests/test_evaluation.py` (32 tests)**: Validates multi-class classification metrics (precision, recall, F1, accuracy, macro/weighted averages), confusion matrix generation, zero-denominator and zero-support resilience, missing/abstained prediction penalization, data-quality auditing (composite identity deduplication, URL syntax, missing/unparseable timestamps, future-date cutoff filtering, out-of-bounds confidence validation, rule non-match vs missing pipeline steps), deterministic stratified annotation sampling without model prediction leakage, domain evaluators (Relevance, Events, Sentiment), strict isolation against cross-article index fallback, duplicate ground-truth detection, conditional event-type accuracy, and CLI command execution across all modes.
 
-*Total: 80 committed tests on `feature/news-intelligence` (expanding to 103 tests with the local Task 5 module).*
+*Total: 103 committed tests on `feature/news-intelligence`, expanding to 135 tests with the Task 6 Phase 1 evaluation module.*
 
 ---
 
@@ -315,14 +336,17 @@ python -m pytest -v
 ├── run_event_extraction.py         # Supply-chain event extraction CLI runner
 ├── run_relevance_eval.py           # Relevance evaluation CLI runner
 ├── run_features.py                 # NLP feature engineering CLI runner
+├── run_evaluation.py               # NLP evaluation & data-quality validation CLI runner
 ├── data/
 │   ├── raw/                        # Ingested news records (git-ignored)
-│   └── processed/                  # Enriched sentiment, event, and feature datasets (git-ignored)
+│   ├── processed/                  # Enriched sentiment, event, and feature datasets (git-ignored)
+│   └── evaluation/                 # Generated annotation templates and evaluation reports (git-ignored)
 ├── src/
 │   ├── news_intelligence/          # News ingestion, normalizer, and relevance module
 │   ├── sentiment/                  # FinBERT financial sentiment inference module
 │   ├── event_extraction/           # Rule-based supply-chain event extraction module
-│   └── features/                   # Standardized feature builder & timestamp aggregator module
+│   ├── features/                   # Standardized feature builder & timestamp aggregator module
+│   └── evaluation/                 # Evaluation metrics, data quality validation, and annotation sampler
 └── tests/                          # 100% offline unit and integration test suite
 ```
 
@@ -413,6 +437,73 @@ python -m pytest -v
 1. **Model Confidence vs. Directional Strength**: The FinBERT `sentiment_score` denotes winning-class posterior probability (softmax confidence $\in [0, 1]$). It is **not** a signed indicator of market direction. The aggregator tracks model confidence separately via `sentiment_confidence_mean` while calculating directional balance via `net_sentiment_polarity` ($\frac{\text{pos} - \text{neg}}{N}$) and `confidence_weighted_sentiment_polarity`.
 2. **Relevance Isolation**: Metrics prefixed with `relevant_*` are computed exclusively over articles tagged `directly_relevant` or `potentially_relevant`. Irrelevant noise (e.g., sports coverage, casual idioms) is strictly quarantined to prevent false signal corruption.
 3. **Point-in-Time Cutoff Enforcement**: Articles published after $T_{\text{cutoff}}$ are strictly filtered out (tracked in `future_articles_filtered`). In historical backtesting, passing `--cutoff` matching the historical price date is required to prevent lookahead bias.
+
+### NLP Evaluation Framework & Data-Quality Validation
+
+The platform includes a dedicated evaluation and quality-assurance subsystem (`src/evaluation/`, `run_evaluation.py`) designed to validate pipeline integrity, generate unbiased human annotation samples, and compute multi-class classification metrics when labeled ground truth is available.
+
+```mermaid
+flowchart TD
+    subgraph InputData["1. Feature & News Datasets"]
+        F1["nlp_article_features.jsonl"]
+        F2["commodity_news.jsonl"]
+    end
+
+    subgraph Quality["2. Data-Quality Audit Engine"]
+        F1 --> V1["DataQualityValidator"]
+        V1 --> R1["Structured Data Quality Report (JSON)"]
+    end
+
+    subgraph Annotation["3. Human Annotation Workflow"]
+        F1 --> S1["AnnotationSampler (Stratified, Fixed Seed)"]
+        S1 --> S2["Prediction-Stripped Template (JSONL)"]
+        S1 --> S3["Annotation Guidelines (Markdown)"]
+        S2 --> H1["Human Annotator Ground Truth"]
+    end
+
+    subgraph Evaluation["4. Supervised Classification Evaluation"]
+        F1 --> E1["NLPEvaluationPipeline"]
+        H1 --> E1
+        E1 --> EV1["Relevance Evaluator (Macro F1, Per-Commodity)"]
+        E1 --> EV2["Event Extractor (Coverage, False Alarms, FN/FP)"]
+        E1 --> EV3["Sentiment Evaluator (Confidence Stats, Accuracy)"]
+        E1 --> R2["Classification Report (JSON & CLI Table)"]
+    end
+```
+
+#### 1. Data-Quality Validation Catalog
+The `DataQualityValidator` inspects article-level feature records across 12 distinct dimensions without discarding or mutating records:
+- **Volume & Commodity Balance**: Record counts per target commodity (`copper`, `gold`, `crude oil`) and detection of unsupported commodity tags.
+- **Identity & Deduplication**: Tracks composite keys `(commodity, canonical_url)` to detect duplicate article entries.
+- **URL Syntax Integrity**: Validates presence of valid web URL schemes (`http://`, `https://`) and network locations.
+- **Temporal Validity**: Validates UTC timestamp parsing, ISO-8601 formatting, and checks for future-dated publications exceeding an explicit prediction cutoff.
+- **Confidence Range Boundaries**: Enforces strict finite numeric bounds $\in [0.0, 1.0]$ for `relevance_score`, `sentiment_score`, and `event_confidence`, rejecting NaN and Infinity values.
+- **Pipeline Completeness vs. Rule Non-Match (No Event Detected)**: Explicitly distinguishes between missing extraction pipeline steps (`extraction_status == "missing"`) and successful rule-based non-matches (`extraction_status == "success"` with `event_type == "other"`). Epistemically, rule non-detection does not prove genuine absence of real-world events without human ground truth.
+- **Taxonomy Compliance**: Audits all enumerated fields against authorized taxonomies (`VALID_RELEVANCE_CLASSES`, `VALID_SENTIMENT_LABELS`, `VALID_EVENT_TYPES`, `VALID_IMPACT_DIRECTIONS`, `VALID_FEATURE_STATUSES`).
+- **Malformed Record Detection**: Traps non-dictionary objects, missing essential identity fields, and corrupt payloads without double-counting multi-failure records in the overall pass rate.
+
+#### 2. Bias-Free Human Annotation Workflow
+To generate reliable ground truth, the `AnnotationSampler`:
+1. **Deduplicates** raw or feature records by `(commodity, canonical_url)`.
+2. **Stratifies** deterministically across target commodities using a fixed random seed (`seed=42`).
+3. **Strips all model predictions** (`relevance_class`, `sentiment_label`, `event_type`, `event_confidence`, etc.) from the template to prevent confirmation bias among human annotators.
+4. **Appends blank ground-truth fields**: `true_relevance_class`, `true_sentiment_label`, `true_event_type`, `true_event_impact_direction`, `annotator_id`, and `annotator_notes`.
+5. **Generates companion guidelines** (`ANNOTATION_GUIDELINES.md`) specifying exact definitions and edge-case handling for each taxonomy class.
+
+#### 3. Classification Evaluation & Metric Calculations
+When human-annotated ground truth is provided, the evaluation pipeline computes:
+- **News Relevance Classification**: Full multi-class confusion matrix, overall accuracy, per-class precision/recall/F1, macro F1 (unweighted average across supported classes), weighted F1 (support-weighted average), and individual per-commodity performance breakdowns.
+- **Supply-Chain Event Extraction**: Evaluates performance across three distinct tiers:
+  - *Binary Event Detection*: Precision, recall, F1, and accuracy for detecting the presence of any operational event ($TP_{\text{det}}$, $FP_{\text{det}}$ false alarms, $FN_{\text{det}}$ missed events, $TN_{\text{det}}$ correct rejections).
+  - *Conditional Event-Type Accuracy*: Evaluated strictly on detected events ($TP_{\text{det}}$) to measure exact type matching accuracy conditional on event detection.
+  - *End-to-End 7-Class Classification*: Standard multi-class confusion matrix and metrics across all 7 event classes (including `other`).
+- **Financial Sentiment Analysis**: Prediction distributions, confidence statistics (mean, median, standard deviation, min, max), and supervised classification metrics when ground-truth sentiment labels exist.
+- **Sample Size Heuristics**: Flags a formal warning if evaluation sample size $N < 30$, while clarifying that statistical reliability depends on class balance, representativeness, and uncertainty across market regimes.
+
+#### 4. Critical Principle: Limitations of Synthetic Testing vs. Real-World Accuracy
+- **Synthetic Unit Tests Establish Software Correctness**: The 135 automated pytest tests verify that math formulas, edge cases, zero denominators, JSON parsers, deduplication logic, and regression protections operate correctly and reproducibly.
+- **Synthetic Tests Do Not Measure Model Accuracy**: Passing synthetic unit tests does **not** indicate that FinBERT or the rule-based event extractor has high real-world accuracy on live market news.
+- **Empirical Claims Require Human Labeled Data**: Model precision, recall, F1, and accuracy may **only** be claimed after evaluating against an independently curated, statistically representative human-annotated evaluation dataset.
 
 ---
 
