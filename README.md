@@ -298,9 +298,9 @@ python -m pytest -v
 - **`tests/test_relevance.py` (19 tests)**: Validates 4-way classification, direct operational mining/oil signals, macroeconomic drivers (Fed rate cuts, CPI, PMI), sports/slang noise filtering, and schema preservation.
 - **`tests/test_sentiment.py` (10 tests)**: Tests FinBERT output mapping, batch inference, lazy model initialization, and malformed text fallback.
 - **`tests/test_event_extraction.py` (22 tests)**: Validates event classification across all 7 taxonomy classes, negation detection (e.g., "strike averted"), commodity-specific geopolitical rules, and missing data handling.
-- **`tests/test_features.py` (19 tests)**: Verifies multi-source record joining, URL canonicalization, UTC timestamp normalization, exact window boundary inclusion/exclusion, strict future leakage filtering, unanchored timestamp handling, confidence mean vs. polarity calculations, relevant-only sentiment isolation, cutoff auditing, and pipeline execution.
+- **`tests/test_features.py` (23 tests)**: Verifies multi-source record joining, partial sentiment merge preservation, sentiment-only/event-only coexistence, multi-commodity identity retention, null-safe matched indicators, URL canonicalization, UTC timestamp normalization, exact window boundary inclusion/exclusion, strict future leakage filtering, unanchored timestamp handling, confidence mean vs. polarity calculations, relevant-only sentiment isolation, cutoff auditing, and pipeline execution.
 
-*Total: 80 committed tests on `feature/news-intelligence` (expanding to 99 tests with the local Task 5 module).*
+*Total: 80 committed tests on `feature/news-intelligence` (expanding to 103 tests with the local Task 5 module).*
 
 ---
 
