@@ -71,3 +71,11 @@ data/raw/*
 data/processed/*
 !data/processed/.gitkeep
 *.jsonl
+
+# Trained ML Models and Serialized Weights (preserve directory with .gitkeep)
+models/*
+!models/.gitkeep
+*.joblib
+*.pkl
+*.parquet
+*.feather

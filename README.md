@@ -279,6 +279,19 @@ python run_features.py --cutoff 2026-10-20T12:00:00Z --windows 1,5
 - `data/processed/nlp_article_features.jsonl` (article-level features)
 - `data/processed/nlp_aggregated_features.jsonl` (windowed rolling features)
 
+### 6. Run Price Prediction & Walk-Forward Backtesting (MLOps 2)
+Trains multi-class LightGBM directional classifiers ($T+1$, $T+5$), benchmarks against majority baselines, generates SHAP explainability attributions, and formats REST API prediction payloads:
+```bash
+# Predict next-day (T+1) direction for a specific commodity
+python run_prediction.py --commodity copper --horizon 1
+
+# Execute end-to-end training and inference for all commodities and horizons
+python run_prediction.py --all
+```
+*Outputs:*
+- `data/processed/commodity_predictions.jsonl` (API contract conforming forecasts)
+- `data/processed/evaluation_metrics.json` (Walk-forward Macro-F1 backtest metrics)
+
 ---
 
 ## 13. Testing & Quality Assurance
