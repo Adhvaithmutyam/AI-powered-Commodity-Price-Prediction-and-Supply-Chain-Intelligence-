@@ -11,9 +11,12 @@ Usage:
     python run_evaluation.py --mode sample --sample-size 50 --seed 42
     python run_evaluation.py --mode sample --input data/processed/nlp_article_features.jsonl --output data/evaluation/annotation_sample.jsonl
 
-    # 3. Evaluate supervised classification against human-labeled ground truth
-    python run_evaluation.py --mode evaluate --ground-truth data/evaluation/ground_truth.jsonl
-    python run_evaluation.py --mode evaluate --input data/processed/nlp_article_features.jsonl --ground-truth data/evaluation/ground_truth.jsonl
+    # 3. Import and validate completed human annotations from CSV to JSONL
+    python run_evaluation.py --mode import-csv --input data/evaluation/annotation_sample.csv --output data/evaluation/human_ground_truth.jsonl
+
+    # 4. Evaluate supervised classification against human-labeled ground truth
+    python run_evaluation.py --mode evaluate --ground-truth data/evaluation/human_ground_truth.jsonl
+    python run_evaluation.py --mode evaluate --input data/processed/nlp_article_features.jsonl --ground-truth data/evaluation/human_ground_truth.jsonl
 
     # Display command-line options
     python run_evaluation.py --help

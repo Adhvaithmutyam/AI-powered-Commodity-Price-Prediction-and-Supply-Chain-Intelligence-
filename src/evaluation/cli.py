@@ -17,7 +17,7 @@ from src.features.builder import load_jsonl_records
 from src.features.aggregator import parse_timestamp_utc
 from src.evaluation.config import EvaluationConfig
 from src.evaluation.data_quality import DataQualityValidator
-from src.evaluation.annotation import generate_annotation_sample
+from src.evaluation.annotation import generate_annotation_sample, AnnotationCSVImporter
 from src.evaluation.evaluator import NLPEvaluationPipeline
 
 logger = logging.getLogger("nlp_evaluation")
@@ -173,6 +173,46 @@ def _format_evaluation_summary(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_csv_import_summary(report: Dict[str, Any]) -> str:
+    lines = []
+    comp = report.get("completion_summary", {})
+    dups = report.get("duplicate_identities", {})
+    tax = report.get("taxonomy_violations", {})
+    mal = report.get("malformed_rows", {})
+
+    lines.append(f"Source CSV Path:              {report.get('csv_path')}")
+    lines.append(f"Target Ground-Truth JSONL:    {report.get('output_jsonl_path')}")
+    lines.append(f"Total Rows Read:              {report.get('total_rows_read', 0)}")
+    lines.append(f"Valid Records Converted:      {report.get('valid_records_count', 0)}")
+    lines.append(f"Import Status:                {report.get('status')}")
+    lines.append("-" * 70)
+    lines.append("Annotation Completion Status:")
+    lines.append(f"  • Fully Labeled Records:    {comp.get('fully_labeled_count', 0)} ({comp.get('fully_labeled_rate', 0.0)*100:.1f}%)")
+    lines.append(f"  • Partially Labeled Records:{comp.get('partially_labeled_count', 0)} ({comp.get('partially_labeled_rate', 0.0)*100:.1f}%)")
+    lines.append(f"  • Unlabeled Records:        {comp.get('unlabeled_count', 0)} ({comp.get('unlabeled_rate', 0.0)*100:.1f}%)")
+    lines.append(f"  • Relevance Labeled:        {comp.get('relevance_labeled_count', 0)}")
+    lines.append(f"  • Sentiment Labeled:        {comp.get('sentiment_labeled_count', 0)}")
+    lines.append(f"  • Events Labeled:           {comp.get('events_labeled_count', 0)}")
+    lines.append(f"  • Impact Direction Labeled: {comp.get('impact_direction_labeled_count', 0)}")
+    lines.append("-" * 70)
+    lines.append("Quality & Integrity Audits:")
+    lines.append(f"  • Duplicate Identities:     {dups.get('duplicate_count', 0)}")
+    lines.append(f"  • Taxonomy Violations:      {tax.get('violation_count', 0)}")
+    lines.append(f"  • Malformed CSV Rows:       {mal.get('malformed_count', 0)}")
+
+    if tax.get("violation_samples"):
+        lines.append("  • Taxonomy Violation Samples:")
+        for s in tax.get("violation_samples", [])[:5]:
+            lines.append(f"      Row {s.get('row_number')}: {s.get('field')}='{s.get('value')}' (allowed: {s.get('allowed')})")
+
+    if dups.get("duplicate_samples"):
+        lines.append("  • Duplicate Identity Samples:")
+        for d in dups.get("duplicate_samples", [])[:5]:
+            lines.append(f"      Row {d.get('row_number')}: {d.get('commodity')} - {d.get('article_url')}")
+
+    return "\n".join(lines)
+
+
 def run_cli(args: Optional[List[str]] = None) -> int:
     """Main CLI runner parsing arguments and delegating to evaluation components."""
     parser = argparse.ArgumentParser(
@@ -181,15 +221,15 @@ def run_cli(args: Optional[List[str]] = None) -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["validate", "sample", "evaluate"],
+        choices=["validate", "sample", "evaluate", "import-csv"],
         default="validate",
-        help="Operational mode: 'validate' data quality, 'sample' for annotation, 'evaluate' labeled data.",
+        help="Operational mode: 'validate' data quality, 'sample' for annotation, 'evaluate' labeled data, 'import-csv' to convert annotated CSV.",
     )
     parser.add_argument(
         "--input",
         type=Path,
         default=Path("data/processed/nlp_article_features.jsonl"),
-        help="Path to input feature or news JSONL file.",
+        help="Path to input feature, news JSONL, or annotated CSV file.",
     )
     parser.add_argument(
         "--ground-truth",
@@ -201,7 +241,7 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         "--output",
         type=Path,
         default=None,
-        help="Path to output report (JSON) or sample template (JSONL).",
+        help="Path to output report (JSON), sample template (JSONL), or converted ground truth (JSONL).",
     )
     parser.add_argument(
         "--cutoff",
@@ -220,6 +260,18 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         type=int,
         default=42,
         help="Random seed for deterministic sampling.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False,
+        help="Allow overwriting existing output files without prompting.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        default=False,
+        help="Strict mode: reject CSV conversion if taxonomy violations or duplicates exist.",
     )
 
     parsed = parser.parse_args(args)
@@ -264,7 +316,8 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         )
 
         print(f"Generated {len(samples)} unbiased annotation records.")
-        print(f"Output JSONL: {output_path}")
+        print(f"Output JSONL: {output_path if output_path.suffix.lower() != '.csv' else output_path.with_suffix('.jsonl')}")
+        print(f"Output CSV:   {output_path.with_suffix('.csv') if output_path.suffix.lower() != '.csv' else output_path}")
         print(f"Guidelines:   {output_path.parent / 'ANNOTATION_GUIDELINES.md'}")
         print("\nArticle distribution by commodity:")
         counts = {}
@@ -305,6 +358,31 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         print(_format_evaluation_summary(report))
         print("-" * 70)
         print(f"Full structured evaluation report saved to: {output_path}")
+        return 0
+
+    # 4. Mode: Import & Validate Human-Annotated CSV
+    elif parsed.mode == "import-csv":
+        _print_banner(f"Import Human-Annotated CSV to JSONL: {parsed.input}")
+        if not parsed.input.exists():
+            print(f"Error: Input CSV file '{parsed.input}' does not exist.")
+            return 1
+
+        output_path = parsed.output or Path("data/evaluation/human_ground_truth.jsonl")
+        importer = AnnotationCSVImporter()
+        try:
+            report = importer.import_csv(
+                csv_path=parsed.input,
+                output_jsonl_path=output_path,
+                overwrite=parsed.overwrite,
+                strict=parsed.strict,
+            )
+        except Exception as e:
+            print(f"Error: CSV import failed: {e}")
+            return 1
+
+        print(_format_csv_import_summary(report))
+        print("-" * 70)
+        print(f"Converted {report['valid_records_count']} ground-truth records saved to: {output_path}")
         return 0
 
     return 0

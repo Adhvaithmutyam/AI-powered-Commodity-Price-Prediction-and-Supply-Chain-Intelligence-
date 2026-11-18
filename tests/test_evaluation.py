@@ -15,6 +15,7 @@ Covers:
 """
 
 from collections import Counter
+import csv
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -40,6 +41,10 @@ from src.evaluation.annotation import (
     validate_annotation_dataset,
     _generate_deterministic_id,
     ANNOTATION_GUIDELINES,
+    AnnotationCSVImporter,
+    convert_annotated_csv_to_jsonl,
+    sanitize_for_spreadsheet,
+    desanitize_from_spreadsheet,
 )
 from src.evaluation.metrics import (
     compute_confusion_matrix,
@@ -1048,3 +1053,286 @@ def test_regression_partial_annotations_graceful_handling():
     assert report["sentiment_evaluation"]["supervised_evaluation"]["status"] == "evaluated"
     assert report["relevance_evaluation"]["sample_count"] == 0
     assert report["event_extraction_evaluation"]["sample_count"] == 0
+
+
+def test_generate_annotation_sample_exports_both_jsonl_and_csv(tmp_path):
+    """Ensure generate_annotation_sample writes both JSONL and Excel-friendly CSV with BOM."""
+    input_file = tmp_path / "articles.jsonl"
+    output_jsonl = tmp_path / "sample.jsonl"
+    output_csv = tmp_path / "sample.csv"
+
+    articles = [
+        {
+            "commodity": "copper",
+            "article_url": f"https://example.com/copper-{i}",
+            "article_title": f"Copper headline {i}",
+            "article_publication_timestamp": "2026-11-10T12:00:00Z",
+            "domain": "example.com",
+            "relevance_class": "directly_relevant",
+            "sentiment_label": "positive",
+        }
+        for i in range(5)
+    ]
+    with open(input_file, "w", encoding="utf-8") as f:
+        for a in articles:
+            f.write(json.dumps(a) + "\n")
+
+    sample = generate_annotation_sample(input_file, output_jsonl, sample_size=3, seed=42)
+    assert len(sample) == 3
+    assert output_jsonl.exists()
+    assert output_csv.exists()
+
+    # Verify CSV content and Excel UTF-8 BOM encoding
+    with open(output_csv, "rb") as f:
+        raw_bytes = f.read()
+    assert raw_bytes.startswith(b"\xef\xbb\xbf")  # UTF-8 BOM
+
+    with open(output_csv, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        csv_rows = list(reader)
+    assert len(csv_rows) == 3
+    assert "true_sentiment_label" in reader.fieldnames
+    assert "sentiment_label" not in reader.fieldnames  # No prediction leakage in CSV headers
+
+
+def test_annotation_sampler_water_filling_imbalanced_distribution():
+    """Water-filling allocation absorbs available scarce commodities and satisfies requested total."""
+    sampler = AnnotationSampler()
+    # 2 copper, 2 gold, 20 crude oil
+    records = []
+    for i in range(2):
+        records.append({
+            "commodity": "copper",
+            "url": f"https://example.com/c-{i}",
+            "title": f"Copper {i}",
+        })
+        records.append({
+            "commodity": "gold",
+            "url": f"https://example.com/g-{i}",
+            "title": f"Gold {i}",
+        })
+    for i in range(20):
+        records.append({
+            "commodity": "crude oil",
+            "url": f"https://example.com/o-{i}",
+            "title": f"Oil {i}",
+        })
+
+    # Request 10 samples
+    sample = sampler.sample(records, sample_size=10, seed=42, stratify_by_commodity=True)
+    assert len(sample) == 10
+    counts = Counter(s["commodity"] for s in sample)
+    # Scarce commodities (2 each) are fully utilized
+    assert counts["copper"] == 2
+    assert counts["gold"] == 2
+    # Remainder (6) comes from crude oil
+    assert counts["crude oil"] == 6
+
+
+def test_csv_importer_valid_utf8_and_bom(tmp_path):
+    """CSV importer correctly parses UTF-8 with BOM and without BOM, preserving all fields."""
+    csv_file = tmp_path / "valid_annotations.csv"
+    output_jsonl = tmp_path / "imported_gt.jsonl"
+
+    content = (
+        "article_id,commodity,article_url,article_title,article_publication_timestamp,domain,language,source_country,true_relevance_class,true_sentiment_label,true_event_type,true_event_impact_direction,annotator_id,annotator_notes\n"
+        "id001,copper,https://example.com/c1,Copper mine strike,2026-11-10T10:00:00Z,example.com,English,Chile,directly_relevant,negative,supply_disruption,potentially_bullish,ann_01,operational strike\n"
+        "id002,gold,https://example.com/g1,Central bank gold buying,2026-11-11T12:00:00Z,example.com,English,US,directly_relevant,positive,demand_change,potentially_bullish,ann_02,reserve growth\n"
+    )
+    with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(content)
+
+    importer = AnnotationCSVImporter()
+    report = importer.import_csv(csv_path=csv_file, output_jsonl_path=output_jsonl)
+
+    assert report["status"] == "success"
+    assert report["valid_records_count"] == 2
+    assert report["completion_summary"]["fully_labeled_count"] == 2
+    assert output_jsonl.exists()
+
+    with open(output_jsonl, "r", encoding="utf-8") as f:
+        records = [json.loads(line) for line in f]
+    assert len(records) == 2
+    assert records[0]["article_id"] == "id001"
+    assert records[0]["commodity"] == "copper"
+    assert records[0]["true_sentiment_label"] == "negative"
+    assert records[0]["true_event_impact_direction"] == "potentially_bullish"
+    assert records[0]["annotator_id"] == "ann_01"
+
+
+def test_csv_importer_detects_incomplete_annotations(tmp_path):
+    """Importer accurately differentiates fully, partially, and completely unlabeled records."""
+    csv_file = tmp_path / "incomplete.csv"
+    content = (
+        "article_id,commodity,article_url,article_title,true_relevance_class,true_sentiment_label,true_event_type\n"
+        "1,copper,https://example.com/1,Title 1,directly_relevant,positive,production_change\n"
+        "2,gold,https://example.com/2,Title 2,directly_relevant,,\n"
+        "3,crude oil,https://example.com/3,Title 3,,,\n"
+    )
+    with open(csv_file, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+
+    importer = AnnotationCSVImporter()
+    report = importer.import_csv(csv_path=csv_file)
+
+    comp = report["completion_summary"]
+    assert comp["fully_labeled_count"] == 1
+    assert comp["partially_labeled_count"] == 1
+    assert comp["unlabeled_count"] == 1
+    assert comp["relevance_labeled_count"] == 2
+    assert comp["sentiment_labeled_count"] == 1
+
+
+def test_csv_importer_detects_taxonomy_violations(tmp_path):
+    """Off-taxonomy values are flagged; strict mode raises ValueError."""
+    csv_file = tmp_path / "violations.csv"
+    content = (
+        "article_id,commodity,article_url,article_title,true_relevance_class,true_sentiment_label,true_event_type,true_event_impact_direction\n"
+        "1,copper,https://example.com/1,Title 1,totally_relevant,super_bullish,fake_event,skyrocketing\n"
+    )
+    with open(csv_file, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+
+    importer = AnnotationCSVImporter()
+
+    # Non-strict mode captures violations in report
+    report = importer.import_csv(csv_path=csv_file, strict=False)
+    assert report["status"] == "completed_with_warnings"
+    assert report["taxonomy_violations"]["violation_count"] == 4
+
+    # Strict mode raises ValueError
+    with pytest.raises(ValueError, match="Strict validation failed"):
+        importer.import_csv(csv_path=csv_file, strict=True)
+
+
+def test_csv_importer_rejects_duplicate_articles(tmp_path):
+    """Duplicate (commodity, URL) pairs are detected and skipped or rejected."""
+    csv_file = tmp_path / "duplicates.csv"
+    content = (
+        "commodity,article_url,article_title,true_sentiment_label\n"
+        "copper,https://example.com/dup,Title A,positive\n"
+        "copper,https://example.com/dup,Title A duplicate,negative\n"
+    )
+    with open(csv_file, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+
+    importer = AnnotationCSVImporter()
+    report = importer.import_csv(csv_path=csv_file, strict=False)
+    assert report["duplicate_identities"]["duplicate_count"] == 1
+    # Only first unique record retained
+    assert report["valid_records_count"] == 1
+
+    with pytest.raises(ValueError, match="duplicate article identity"):
+        importer.import_csv(csv_path=csv_file, strict=True)
+
+
+def test_csv_importer_cross_commodity_shared_url_allowed(tmp_path):
+    """Distinct commodities referencing the exact same URL produce distinct valid records."""
+    csv_file = tmp_path / "shared_url.csv"
+    content = (
+        "commodity,article_url,article_title,true_sentiment_label\n"
+        "copper,https://example.com/mining-report,Mining Sector Review,positive\n"
+        "gold,https://example.com/mining-report,Mining Sector Review,neutral\n"
+    )
+    with open(csv_file, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+
+    importer = AnnotationCSVImporter()
+    report = importer.import_csv(csv_path=csv_file, strict=True)
+    assert report["duplicate_identities"]["duplicate_count"] == 0
+    assert report["valid_records_count"] == 2
+
+
+def test_csv_importer_formula_injection_defense(tmp_path):
+    """Formula characters are sanitized during export and restored without identity corruption."""
+    csv_file = tmp_path / "formula_test.csv"
+    jsonl_output = tmp_path / "formula_out.jsonl"
+
+    # Verify sanitizer
+    assert sanitize_for_spreadsheet("=HYPERLINK('evil')") == "'=HYPERLINK('evil')"
+    assert sanitize_for_spreadsheet("+4.5% price rally") == "'+4.5% price rally"
+    assert sanitize_for_spreadsheet("-10% crash") == "'-10% crash"
+    assert sanitize_for_spreadsheet("@mention") == "'@mention"
+    assert sanitize_for_spreadsheet("Normal headline") == "Normal headline"
+
+    # Verify desanitizer
+    assert desanitize_from_spreadsheet("'=HYPERLINK('evil')") == "=HYPERLINK('evil')"
+    assert desanitize_from_spreadsheet("'+4.5% price rally") == "+4.5% price rally"
+    assert desanitize_from_spreadsheet("Normal headline") == "Normal headline"
+    assert desanitize_from_spreadsheet("'Normal starting with quote") == "'Normal starting with quote"
+
+    # End-to-end CSV write and readback
+    content = (
+        "commodity,article_url,article_title,true_sentiment_label\n"
+        "crude oil,https://example.com/formula,'=1+1 calculation,positive\n"
+    )
+    with open(csv_file, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+
+    report = convert_annotated_csv_to_jsonl(csv_file, jsonl_output)
+    assert report["valid_records_count"] == 1
+
+    with open(jsonl_output, "r", encoding="utf-8") as f:
+        rec = json.loads(f.readline())
+    assert rec["article_title"] == "=1+1 calculation"
+    # Stable ID matches underlying unescaped identity
+    expected_id = _generate_deterministic_id("crude oil", "https://example.com/formula")
+    assert rec["article_id"] == expected_id
+
+
+def test_csv_importer_rejects_malformed_csv(tmp_path):
+    """Missing required columns or empty files raise ValueError."""
+    empty_csv = tmp_path / "empty.csv"
+    empty_csv.write_text("", encoding="utf-8")
+
+    missing_cols_csv = tmp_path / "missing_cols.csv"
+    missing_cols_csv.write_text("random_header,notes\nval1,val2\n", encoding="utf-8")
+
+    importer = AnnotationCSVImporter()
+    with pytest.raises(ValueError, match="no header row"):
+        importer.import_csv(empty_csv)
+
+    with pytest.raises(ValueError, match="missing required column"):
+        importer.import_csv(missing_cols_csv)
+
+
+def test_csv_importer_safeguards_existing_files(tmp_path):
+    """Existing ground-truth JSONL is never overwritten without overwrite=True."""
+    csv_file = tmp_path / "data.csv"
+    csv_file.write_text("commodity,article_url,article_title\ncopper,https://example.com/1,Title\n", encoding="utf-8")
+    out_file = tmp_path / "output.jsonl"
+    out_file.write_text('{"existing": true}\n', encoding="utf-8")
+
+    importer = AnnotationCSVImporter()
+    with pytest.raises(FileExistsError, match="already exists"):
+        importer.import_csv(csv_file, output_jsonl_path=out_file, overwrite=False)
+
+    # Overwrite permitted
+    importer.import_csv(csv_file, output_jsonl_path=out_file, overwrite=True)
+    with open(out_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    assert len(lines) == 1
+    assert "copper" in lines[0]
+
+
+def test_cli_import_csv_mode(tmp_path):
+    """CLI runner executes import-csv mode and creates JSONL ground truth."""
+    csv_file = tmp_path / "cli_sample.csv"
+    output_jsonl = tmp_path / "cli_gt.jsonl"
+
+    content = (
+        "commodity,article_url,article_title,true_sentiment_label\n"
+        "copper,https://example.com/cli,Copper strike,negative\n"
+    )
+    with open(csv_file, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+
+    from src.evaluation.cli import run_cli
+    exit_code = run_cli([
+        "--mode", "import-csv",
+        "--input", str(csv_file),
+        "--output", str(output_jsonl),
+        "--overwrite",
+    ])
+    assert exit_code == 0
+    assert output_jsonl.exists()

@@ -311,7 +311,7 @@ class DataQualityValidator:
                     unsupported_event_types[ev_type_str] += 1
                     invalid_record_indices.add(idx)
 
-                if ev_status_clean == "success":
+                if ev_status_clean in ("success", "unclassified"):
                     successful_event_extraction_count += 1
                     if ev_type_str == "other":
                         no_event_rule_match_count += 1

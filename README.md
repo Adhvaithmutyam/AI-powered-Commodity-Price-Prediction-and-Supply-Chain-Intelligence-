@@ -281,23 +281,29 @@ python run_features.py --cutoff 2026-10-20T12:00:00Z --windows 1,5
 - `data/processed/nlp_aggregated_features.jsonl` (windowed rolling features)
 
 ### 6. Run NLP Evaluation & Data-Quality Validation
-Executes data quality audits, generates unbiased human annotation sample templates, or evaluates model predictions against human ground truth:
+Executes data quality audits, generates unbiased human annotation sample templates, converts completed CSV annotations, or evaluates model predictions against human ground truth:
 ```bash
 # A. Audit data quality of article-level features
 python run_evaluation.py --mode validate
 
-# B. Generate a reproducible, bias-free human annotation template
+# B. Generate a reproducible, bias-free human annotation template (JSONL + CSV)
 python run_evaluation.py --mode sample --sample-size 50 --seed 42
 
-# C. Evaluate pipeline predictions against human-labeled ground truth
-python run_evaluation.py --mode evaluate --ground-truth data/evaluation/ground_truth.jsonl
+# C. Import and validate completed human annotations from Excel CSV to JSONL
+python run_evaluation.py --mode import-csv --input data/evaluation/annotation_sample.csv --output data/evaluation/human_ground_truth.jsonl
+
+# D. Evaluate pipeline predictions against human-labeled ground truth
+python run_evaluation.py --mode evaluate --ground-truth data/evaluation/human_ground_truth.jsonl
 ```
 *Optional Flags:*
-- `--input <PATH>`: Custom input JSONL file path (defaults to article features).
-- `--output <PATH>`: Output report JSON or sample template JSONL path.
+- `--input <PATH>`: Custom input JSONL or CSV file path.
+- `--output <PATH>`: Output report JSON, sample template, or converted ground-truth JSONL path.
+- `--ground-truth <PATH>`: Labeled ground-truth JSONL file path for `evaluate` mode.
 - `--cutoff <ISO_TIMESTAMP>`: Evaluation cutoff timestamp to detect future-dated articles.
 - `--sample-size <N>`: Number of records to extract for annotation (default: 50).
 - `--seed <INT>`: Random seed for deterministic sampling (default: 42).
+- `--overwrite`: Explicitly authorize overwriting existing output files.
+- `--strict`: Strict validation mode rejecting CSV conversion on taxonomy violations or duplicate identities.
 
 ---
 
@@ -319,9 +325,9 @@ python -m pytest -v
 - **`tests/test_sentiment.py` (10 tests)**: Tests FinBERT output mapping, batch inference, lazy model initialization, and malformed text fallback.
 - **`tests/test_event_extraction.py` (22 tests)**: Validates event classification across all 7 taxonomy classes, negation detection (e.g., "strike averted"), commodity-specific geopolitical rules, and missing data handling.
 - **`tests/test_features.py` (23 tests)**: Verifies multi-source record joining, partial sentiment merge preservation, sentiment-only/event-only coexistence, multi-commodity identity retention, null-safe matched indicators, URL canonicalization, UTC timestamp normalization, exact window boundary inclusion/exclusion, strict future leakage filtering, unanchored timestamp handling, confidence mean vs. polarity calculations, relevant-only sentiment isolation, cutoff auditing, and pipeline execution.
-- **`tests/test_evaluation.py` (32 tests)**: Validates multi-class classification metrics (precision, recall, F1, accuracy, macro/weighted averages), confusion matrix generation, zero-denominator and zero-support resilience, missing/abstained prediction penalization, data-quality auditing (composite identity deduplication, URL syntax, missing/unparseable timestamps, future-date cutoff filtering, out-of-bounds confidence validation, rule non-match vs missing pipeline steps), deterministic stratified annotation sampling without model prediction leakage, domain evaluators (Relevance, Events, Sentiment), strict isolation against cross-article index fallback, duplicate ground-truth detection, conditional event-type accuracy, and CLI command execution across all modes.
+- **`tests/test_evaluation.py` (43 tests)**: Validates multi-class classification metrics (precision, recall, F1, accuracy, macro/weighted averages), confusion matrix generation, zero-denominator and zero-support resilience, missing/abstained prediction penalization, data-quality auditing (composite identity deduplication, URL syntax, missing/unparseable timestamps, future-date cutoff filtering, out-of-bounds confidence validation, rule non-match vs missing pipeline steps), deterministic stratified annotation sampling without model prediction leakage, dual JSONL and Excel-friendly CSV export with UTF-8 BOM, water-filling quota allocation for imbalanced commodity pools, domain evaluators (Relevance, Events, Sentiment), strict isolation against cross-article index fallback, duplicate ground-truth detection, conditional event-type accuracy, annotated CSV-to-JSONL conversion, Excel UTF-8 BOM ingestion, taxonomy compliance checks, missing/partial annotation detection, duplicate identity rejection, cross-commodity shared URL preservation, spreadsheet formula injection defense (OWASP DDE prevention), target file overwrite protection, and CLI command execution across all modes.
 
-*Total: 103 committed tests on `feature/news-intelligence`, expanding to 135 tests with the Task 6 Phase 1 evaluation module.*
+*Total: 103 committed tests on `feature/news-intelligence`, expanding to 146 tests with the Task 6 Phase 1 and Phase 2A evaluation modules.*
 
 ---
 
@@ -482,15 +488,50 @@ The `DataQualityValidator` inspects article-level feature records across 12 dist
 - **Taxonomy Compliance**: Audits all enumerated fields against authorized taxonomies (`VALID_RELEVANCE_CLASSES`, `VALID_SENTIMENT_LABELS`, `VALID_EVENT_TYPES`, `VALID_IMPACT_DIRECTIONS`, `VALID_FEATURE_STATUSES`).
 - **Malformed Record Detection**: Traps non-dictionary objects, missing essential identity fields, and corrupt payloads without double-counting multi-failure records in the overall pass rate.
 
-#### 2. Bias-Free Human Annotation Workflow
+#### 2. Bias-Free Human Annotation Workflow (Phase 2A)
+
+> [!IMPORTANT]
+> **Dataset Characterization: Real-World Pilot Annotation Dataset**:
+> The 50-article annotation sample (`data/evaluation/annotation_sample.csv` and `.jsonl`) is formally designated as a **real-world pilot annotation dataset**, NOT a statistically representative benchmark across commodity markets.
+>
+> **Known Limitations & Statistical Consequences:**
+> - **Commodity Imbalance**: Skewed toward crude oil (40 crude oil, 5 copper, 5 gold) due to repeated HTTP 429 rate limits on GDELT public servers for complex copper and gold queries. Fake articles were strictly not generated to artificially balance the pool.
+> - **Sample Size & Variance**: Small sample strata for copper ($N=5$) and gold ($N=5$) mean class-specific metrics will have high binomial variance and wide confidence intervals. Macro F1 across commodities will be disproportionately sensitive to single-article classification errors.
+> - **Temporal & Publisher Scope**: Articles span a 3-week window (October 20 to November 12, 2026), primarily from financial wire services, without spanning multiple economic regimes or physical supply cycles.
+> - **Empirical Prediction Distributions**:
+>   - *Relevance*: 19 irrelevant (34.5%), 11 uncertain (20.0%), 20 potentially relevant (36.4%), 5 directly relevant (9.1%).
+>   - *Sentiment*: 28 neutral (50.9%), 16 negative (29.1%), 11 positive (20.0%).
+>   - *Event Types*: 53 `other` (96.4%), 1 `inventory_change` (1.8%), 1 `geopolitical_risk` (1.8%). Rare physical event types (`supply_disruption`, `demand_change`, `policy_action`, `production_change`) have zero automated detections.
+> - **Evaluation Purpose**: This pilot enables calibrating the human annotation guidelines, validating inter-annotator agreement protocols, and confirming end-to-end evaluation pipeline execution before launching large-scale scheduled collection.
+
 To generate reliable ground truth, the `AnnotationSampler`:
 1. **Deduplicates** raw or feature records by `(commodity, canonical_url)`.
-2. **Stratifies** deterministically across target commodities using a fixed random seed (`seed=42`).
+2. **Stratifies** deterministically across target commodities using a fixed random seed (`seed=42`) with fair water-filling quota allocation when commodity pools are imbalanced.
 3. **Strips all model predictions** (`relevance_class`, `sentiment_label`, `event_type`, `event_confidence`, etc.) from the template to prevent confirmation bias among human annotators.
 4. **Appends blank ground-truth fields**: `true_relevance_class`, `true_sentiment_label`, `true_event_type`, `true_event_impact_direction`, `annotator_id`, and `annotator_notes`.
-5. **Generates companion guidelines** (`ANNOTATION_GUIDELINES.md`) specifying exact definitions and edge-case handling for each taxonomy class.
+5. **Exports Dual Formats**: Produces both standard JSONL (`annotation_sample.jsonl`) and Excel-friendly CSV (`annotation_sample.csv` with UTF-8 BOM) for seamless human review.
+6. **Formula Injection Defense (OWASP DDE Mitigation)**: Cells starting with formula triggers (`=`, `+`, `-`, `@`, `\t`, `\r`) are automatically escaped with `'` on export to prevent spreadsheet formula execution, and desanitized losslessly upon import without identity corruption.
+7. **Generates companion guidelines** (`ANNOTATION_GUIDELINES.md`) specifying:
+   - **Crucial Distinction between Sentiment and Price Impact**: Documents that financial sentiment (emotional or business tone of an operational disaster or strike) is frequently the inverse of commodity price impact (supply disruption creates deficit $\implies$ bullish price rally).
+   - Multi-commodity concrete examples across copper, gold, and crude oil.
+   - Ambiguous and irrelevant edge-case definitions.
+   - Dual-annotator agreement protocol ($\kappa \ge 0.75$) and domain expert adjudication.
 
-#### 3. Classification Evaluation & Metric Calculations
+#### 3. CSV-to-JSONL Ground-Truth Import Workflow
+Human annotators can label the CSV in Microsoft Excel, LibreOffice Calc, or Google Sheets and convert it back to evaluation-ready JSONL:
+```bash
+python run_evaluation.py --mode import-csv --input data/evaluation/annotation_sample.csv --output data/evaluation/human_ground_truth.jsonl
+```
+The `AnnotationCSVImporter`:
+- Ingests UTF-8 and UTF-8 with BOM (`utf-8-sig`) saved by Excel.
+- Validates all entered labels against established taxonomies (`VALID_RELEVANCE_CLASSES`, `VALID_SENTIMENT_LABELS`, `VALID_EVENT_TYPES`, `VALID_IMPACT_DIRECTIONS`).
+- Differentiates fully labeled, partially labeled, and unlabeled records.
+- Detects and rejects duplicate article identities `(commodity, canonical_url)` while supporting cross-commodity shared URLs.
+- Never populates missing human labels with AI model predictions (missing labels remain empty).
+- Rejects overwriting existing ground-truth files unless `--overwrite` is explicitly passed.
+- Enforces strict mode with `--strict` to fail on any taxonomy violation or duplicate entry.
+
+#### 4. Classification Evaluation & Metric Calculations
 When human-annotated ground truth is provided, the evaluation pipeline computes:
 - **News Relevance Classification**: Full multi-class confusion matrix, overall accuracy, per-class precision/recall/F1, macro F1 (unweighted average across supported classes), weighted F1 (support-weighted average), and individual per-commodity performance breakdowns.
 - **Supply-Chain Event Extraction**: Evaluates performance across three distinct tiers:
@@ -500,8 +541,8 @@ When human-annotated ground truth is provided, the evaluation pipeline computes:
 - **Financial Sentiment Analysis**: Prediction distributions, confidence statistics (mean, median, standard deviation, min, max), and supervised classification metrics when ground-truth sentiment labels exist.
 - **Sample Size Heuristics**: Flags a formal warning if evaluation sample size $N < 30$, while clarifying that statistical reliability depends on class balance, representativeness, and uncertainty across market regimes.
 
-#### 4. Critical Principle: Limitations of Synthetic Testing vs. Real-World Accuracy
-- **Synthetic Unit Tests Establish Software Correctness**: The 135 automated pytest tests verify that math formulas, edge cases, zero denominators, JSON parsers, deduplication logic, and regression protections operate correctly and reproducibly.
+#### 5. Critical Principle: Limitations of Synthetic Testing vs. Real-World Accuracy
+- **Synthetic Unit Tests Establish Software Correctness**: The 146 automated pytest tests verify that math formulas, edge cases, zero denominators, JSON parsers, CSV conversions, deduplication logic, and regression protections operate correctly and reproducibly.
 - **Synthetic Tests Do Not Measure Model Accuracy**: Passing synthetic unit tests does **not** indicate that FinBERT or the rule-based event extractor has high real-world accuracy on live market news.
 - **Empirical Claims Require Human Labeled Data**: Model precision, recall, F1, and accuracy may **only** be claimed after evaluating against an independently curated, statistically representative human-annotated evaluation dataset.
 
