@@ -1,0 +1,1 @@
+{"record": {"commodity": "crude oil", "timestamp": "2026-11-18T00:00:00Z", "open": 85.75, "high": 84.7699966430664, "low": 82.37999725341797, "close": 82.94000244140625, "volume": 105884.0, "currency": "USD", "unit": "USD/barrel", "source": "Yahoo Finance", "ticker": "CL=F", "benchmark": "WTI Crude Oil Futures"}, "errors": ["High must be greater than or equal to Open and Close"]}
