@@ -5,17 +5,51 @@ Defines prediction horizons, target thresholds, model parameters, and path defau
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
 class PredictionConfig:
-    """Configuration settings for quantitative features, models, and backtesting."""
+    """Configuration settings for quantitative features, models, data loader, and backtesting."""
 
     # Target commodities
     commodities: List[str] = field(
         default_factory=lambda: ["crude oil", "copper", "gold"]
     )
+
+    # Commodity instrument & provider symbol mapping (Yahoo Finance Futures)
+    # Preserves benchmark instrument identity:
+    # - Crude Oil: Brent Crude Futures (BZ=F)
+    # - Copper: COMEX Copper Futures (HG=F)
+    # - Gold: COMEX Gold Futures (GC=F)
+    commodity_symbol_map: Dict[str, Dict[str, str]] = field(
+        default_factory=lambda: {
+            "crude oil": {
+                "symbol": "BZ=F",
+                "name": "Brent Crude Oil Futures",
+                "benchmark": "Brent Crude Spot",
+                "exchange": "ICE Europe",
+            },
+            "copper": {
+                "symbol": "HG=F",
+                "name": "Copper Futures (COMEX)",
+                "benchmark": "COMEX Copper Grade A",
+                "exchange": "COMEX",
+            },
+            "gold": {
+                "symbol": "GC=F",
+                "name": "Gold Futures (COMEX)",
+                "benchmark": "London Gold Fixing",
+                "exchange": "COMEX",
+            },
+        }
+    )
+
+    # Data loading and caching configuration
+    use_synthetic_data: bool = False  # Explicit fallback only; False by default
+    offline_mode: bool = False        # When True, reads strictly from local CSV cache
+    cache_expiry_hours: int = 24      # Cache validity window before re-fetching
+    lookback_years: int = 3           # Historical daily lookback window (approx 3 years)
 
     # Forecast horizons in trading days: T+1 (next day) and T+5 (next week)
     horizons: List[int] = field(default_factory=lambda: [1, 5])
@@ -31,7 +65,7 @@ class PredictionConfig:
     )
 
     # Model training hyper-parameters (LightGBM multi-class GBDT)
-    lgbm_params: Dict[str, any] = field(
+    lgbm_params: Dict[str, Any] = field(
         default_factory=lambda: {
             "objective": "multiclass",
             "num_class": 3,
@@ -52,7 +86,7 @@ class PredictionConfig:
     train_window_size: int = 252  # ~1 trading year
     test_window_size: int = 42    # ~2 trading months
 
-    # File paths
+    # File and directory paths
     price_data_dir: Path = field(default_factory=lambda: Path("data/raw/prices"))
     sentiment_data_path: Path = field(
         default_factory=lambda: Path("data/processed/commodity_news_sentiment.jsonl")
