@@ -45,6 +45,14 @@ from src.evaluation.annotation import (
     convert_annotated_csv_to_jsonl,
     sanitize_for_spreadsheet,
     desanitize_from_spreadsheet,
+    prepare_pilot_annotation_packages,
+)
+from src.evaluation.quality_control import (
+    compute_cohens_kappa,
+    interpret_cohens_kappa,
+    AnnotationAgreementAuditor,
+    AnnotationAdjudicator,
+    load_annotation_records,
 )
 from src.evaluation.metrics import (
     compute_confusion_matrix,
@@ -1336,3 +1344,746 @@ def test_cli_import_csv_mode(tmp_path):
     ])
     assert exit_code == 0
     assert output_jsonl.exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 6 Phase 2B: Quality Control, Inter-Annotator Agreement, and Adjudication Tests
+# ---------------------------------------------------------------------------
+
+def test_cohens_kappa_perfect_agreement():
+    """Exact Cohen's Kappa evaluates to 1.0 when two raters agree completely."""
+    y1 = ["positive", "negative", "neutral", "positive", "neutral", "negative"]
+    y2 = ["positive", "negative", "neutral", "positive", "neutral", "negative"]
+    kappa = compute_cohens_kappa(y1, y2, categories=["positive", "negative", "neutral"])
+    assert kappa == 1.0
+    assert interpret_cohens_kappa(kappa) == "almost_perfect_agreement"
+
+
+def test_cohens_kappa_systematic_disagreement():
+    """Exact Cohen's Kappa evaluates to negative score when raters systematically disagree."""
+    y1 = ["positive", "positive", "negative", "negative"]
+    y2 = ["negative", "negative", "positive", "positive"]
+    kappa = compute_cohens_kappa(y1, y2, categories=["positive", "negative"])
+    assert kappa == -1.0
+    assert interpret_cohens_kappa(kappa) == "poor_systematic_disagreement"
+
+
+def test_cohens_kappa_boundary_and_empty_inputs():
+    """Boundary cases like empty lists, unequal inputs, or uniform rater classifications return safe values."""
+    assert compute_cohens_kappa([], []) is None
+    assert compute_cohens_kappa(["positive"], ["positive", "negative"]) is None
+    assert compute_cohens_kappa(["positive"], ["positive"], categories=[]) is None
+
+    # Degenerate uniform single category from both raters: P_o = 1.0, P_e = 1.0 -> 0/0 (undefined)
+    y1 = ["directly_relevant", "directly_relevant", "directly_relevant"]
+    y2 = ["directly_relevant", "directly_relevant", "directly_relevant"]
+    assert compute_cohens_kappa(y1, y2) is None
+    assert interpret_cohens_kappa(None) == "undefined_constant_distribution"
+
+
+def test_cohens_kappa_interpretation_benchmarks():
+    """Landis & Koch (1977) interpretation mapping strictly categorizes Kappa scores."""
+    assert interpret_cohens_kappa(0.95) == "almost_perfect_agreement"
+    assert interpret_cohens_kappa(0.75) == "substantial_agreement"
+    assert interpret_cohens_kappa(0.55) == "moderate_agreement"
+    assert interpret_cohens_kappa(0.35) == "fair_agreement"
+    assert interpret_cohens_kappa(0.15) == "slight_agreement"
+    assert interpret_cohens_kappa(0.0) == "chance_agreement"
+    assert interpret_cohens_kappa(-0.40) == "poor_systematic_disagreement"
+
+
+def test_prepare_pilot_annotation_packages(tmp_path):
+    """
+    Validates generation of primary (50 items), secondary (20% overlap = 10 items: 2 copper, 2 gold, 6 crude oil),
+    and assignment manifest with blank human fields and zero prediction leakage.
+    """
+    sample_file = tmp_path / "pilot_sample.jsonl"
+    records = []
+    # 5 copper, 5 gold, 40 crude oil
+    for i in range(5):
+        records.append({
+            "commodity": "copper",
+            "article_url": f"https://example.com/copper/{i}",
+            "article_title": f"Copper title {i}",
+            "article_publication_timestamp": "2026-11-01T10:00:00Z",
+            "domain": "mining.com",
+            "language": "en",
+        })
+    for i in range(5):
+        records.append({
+            "commodity": "gold",
+            "article_url": f"https://example.com/gold/{i}",
+            "article_title": f"Gold title {i}",
+            "article_publication_timestamp": "2026-11-01T10:00:00Z",
+            "domain": "gold.org",
+            "language": "en",
+        })
+    for i in range(40):
+        records.append({
+            "commodity": "crude oil",
+            "article_url": f"https://example.com/oil/{i}",
+            "article_title": f"Oil title {i}",
+            "article_publication_timestamp": "2026-11-01T10:00:00Z",
+            "domain": "oilprice.com",
+            "language": "en",
+        })
+
+    with open(sample_file, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+    pkg_dir = tmp_path / "packages"
+    res = prepare_pilot_annotation_packages(sample_file, output_dir=pkg_dir, overlap_fraction=0.20, seed=42)
+
+    assert res["status"] == "success"
+    assert res["primary_count"] == 50
+    assert res["secondary_count"] == 10
+    assert res["overlap_count"] == 10
+    assert res["commodity_breakdown"]["secondary"] == {"crude oil": 6, "gold": 2, "copper": 2}
+
+    # Verify primary files exist
+    assert Path(res["files_generated"]["primary_jsonl"]).exists()
+    assert Path(res["files_generated"]["primary_csv"]).exists()
+    assert Path(res["files_generated"]["secondary_jsonl"]).exists()
+    assert Path(res["files_generated"]["secondary_csv"]).exists()
+    assert Path(res["files_generated"]["manifest_json"]).exists()
+    assert Path(res["files_generated"]["manifest_csv"]).exists()
+    assert Path(res["files_generated"]["instructions_markdown"]).exists()
+    assert Path(res["files_generated"]["guidelines_markdown"]).exists()
+
+    # Verify all human fields are blank and no prediction fields exist
+    with open(res["files_generated"]["primary_jsonl"], "r", encoding="utf-8") as f:
+        p_recs = [json.loads(line) for line in f]
+    with open(res["files_generated"]["secondary_jsonl"], "r", encoding="utf-8") as f:
+        s_recs = [json.loads(line) for line in f]
+
+    human_fields = [
+        "true_relevance_class",
+        "true_sentiment_label",
+        "true_event_type",
+        "true_event_impact_direction",
+        "annotator_id",
+        "annotator_notes",
+    ]
+    forbidden_prediction_fields = [
+        "relevance_score",
+        "finbert_sentiment_label",
+        "finbert_sentiment_score",
+        "supply_chain_event_type",
+        "event_confidence",
+        "is_relevant",
+    ]
+
+    for rec in p_recs + s_recs:
+        for fld in human_fields:
+            assert rec[fld] == "", f"Field {fld} is not blank"
+        for fld in forbidden_prediction_fields:
+            assert fld not in rec, f"Model prediction field {fld} leaked into template"
+
+
+def test_annotation_agreement_auditor():
+    """AnnotationAgreementAuditor matches overlapping records and calculates task metrics and disagreements."""
+    primary = [
+        {
+            "article_id": "art_001",
+            "commodity": "copper",
+            "article_url": "https://example.com/1",
+            "article_title": "Copper mine strike",
+            "true_relevance_class": "directly_relevant",
+            "true_sentiment_label": "negative",
+            "true_event_type": "supply_disruption",
+            "true_event_impact_direction": "potentially_bullish",
+            "annotator_id": "ann_primary",
+        },
+        {
+            "article_id": "art_002",
+            "commodity": "gold",
+            "article_url": "https://example.com/2",
+            "article_title": "Gold reserves up",
+            "true_relevance_class": "directly_relevant",
+            "true_sentiment_label": "positive",
+            "true_event_type": "inventory_change",
+            "true_event_impact_direction": "potentially_bearish",
+            "annotator_id": "ann_primary",
+        },
+        {
+            "article_id": "art_003",
+            "commodity": "crude oil",
+            "article_url": "https://example.com/3",
+            "article_title": "Unshared oil news",
+            "true_relevance_class": "directly_relevant",
+            "true_sentiment_label": "neutral",
+            "true_event_type": "other",
+            "true_event_impact_direction": "uncertain",
+            "annotator_id": "ann_primary",
+        },
+    ]
+
+    secondary = [
+        # art_001: complete agreement
+        {
+            "article_id": "art_001",
+            "commodity": "copper",
+            "article_url": "https://example.com/1",
+            "article_title": "Copper mine strike",
+            "true_relevance_class": "directly_relevant",
+            "true_sentiment_label": "negative",
+            "true_event_type": "supply_disruption",
+            "true_event_impact_direction": "potentially_bullish",
+            "annotator_id": "ann_secondary",
+        },
+        # art_002: disagreement on sentiment and event type
+        {
+            "article_id": "art_002",
+            "commodity": "gold",
+            "article_url": "https://example.com/2",
+            "article_title": "Gold reserves up",
+            "true_relevance_class": "directly_relevant",
+            "true_sentiment_label": "neutral",
+            "true_event_type": "production_change",
+            "true_event_impact_direction": "potentially_bearish",
+            "annotator_id": "ann_secondary",
+        },
+    ]
+
+    auditor = AnnotationAgreementAuditor()
+    report = auditor.audit(primary, secondary)
+
+    meta = report["audit_metadata"]
+    assert meta["matched_overlapping_records"] == 2
+    assert meta["unmatched_secondary_records"] == 0
+    assert meta["total_records_with_disagreements"] == 1
+
+    # Task metrics: relevance agreed 2/2 (1.0), sentiment agreed 1/2 (0.5), impact direction agreed 2/2 (1.0)
+    tasks = report["task_agreements"]
+    assert tasks["relevance"]["observed_agreement_rate"] == 1.0
+    assert tasks["sentiment"]["observed_agreement_rate"] == 0.5
+    assert tasks["event_type"]["observed_agreement_rate"] == 0.5
+    assert tasks["impact_direction"]["observed_agreement_rate"] == 1.0
+
+    # Disagreements
+    disagreements = report["disagreements"]
+    assert len(disagreements) == 1
+    assert disagreements[0]["article_id"] == "art_002"
+    assert "true_sentiment_label" in disagreements[0]["disagreed_fields"]
+    assert "true_event_type" in disagreements[0]["disagreed_fields"]
+    assert disagreements[0]["field_values"]["true_sentiment_label"]["primary"] == "positive"
+    assert disagreements[0]["field_values"]["true_sentiment_label"]["secondary"] == "neutral"
+
+
+def test_annotation_adjudicator_template_and_merge(tmp_path):
+    """AnnotationAdjudicator creates adjudication template and merges consensus with human resolutions."""
+    audit_report = {
+        "disagreements": [
+            {
+                "article_id": "art_conflict",
+                "commodity": "copper",
+                "article_title": "Disputed copper event",
+                "article_url": "https://example.com/disputed",
+                "primary_annotator_id": "ann_1",
+                "secondary_annotator_id": "ann_2",
+                "disagreed_fields": ["true_event_type"],
+                "field_values": {
+                    "true_relevance_class": {"primary": "directly_relevant", "secondary": "directly_relevant"},
+                    "true_sentiment_label": {"primary": "negative", "secondary": "negative"},
+                    "true_event_type": {"primary": "supply_disruption", "secondary": "other"},
+                    "true_event_impact_direction": {"primary": "potentially_bullish", "secondary": "uncertain"},
+                },
+            }
+        ]
+    }
+
+    adjudicator = AnnotationAdjudicator()
+    template_csv = tmp_path / "adjudication_template.csv"
+    template_rows = adjudicator.create_adjudication_template(audit_report, output_csv_path=template_csv)
+
+    assert len(template_rows) == 1
+    assert template_csv.exists()
+    assert template_rows[0]["article_id"] == "art_conflict"
+    assert template_rows[0]["adjudicated_event_type"] == ""
+
+    # Simulate human expert adjudication
+    adjudicated_records = [
+        {
+            "article_id": "art_conflict",
+            "adjudicated_relevance": "directly_relevant",
+            "adjudicated_sentiment": "negative",
+            "adjudicated_event_type": "supply_disruption",
+            "adjudicated_impact_direction": "potentially_bullish",
+            "adjudicator_id": "expert_01",
+            "adjudication_notes": "Rockburst is a classic supply disruption.",
+        }
+    ]
+
+    primary_records = [
+        {
+            "article_id": "art_conflict",
+            "commodity": "copper",
+            "article_url": "https://example.com/disputed",
+            "article_title": "Disputed copper event",
+            "true_relevance_class": "directly_relevant",
+            "true_sentiment_label": "negative",
+            "true_event_type": "supply_disruption",
+            "true_event_impact_direction": "potentially_bullish",
+            "annotator_id": "ann_1",
+        },
+        {
+            "article_id": "art_consensus",
+            "commodity": "gold",
+            "article_url": "https://example.com/consensus",
+            "article_title": "Agreed gold news",
+            "true_relevance_class": "directly_relevant",
+            "true_sentiment_label": "neutral",
+            "true_event_type": "other",
+            "true_event_impact_direction": "unknown",
+            "annotator_id": "ann_1",
+        },
+        {
+            "article_id": "art_unshared",
+            "commodity": "crude oil",
+            "article_url": "https://example.com/unshared",
+            "article_title": "Primary only oil news",
+            "true_relevance_class": "directly_relevant",
+            "true_sentiment_label": "positive",
+            "true_event_type": "production_change",
+            "true_event_impact_direction": "potentially_bearish",
+            "annotator_id": "ann_1",
+        },
+    ]
+
+    secondary_records = [
+        {
+            "article_id": "art_conflict",
+            "commodity": "copper",
+            "true_relevance_class": "directly_relevant",
+            "true_sentiment_label": "negative",
+            "true_event_type": "other",
+            "true_event_impact_direction": "potentially_bullish",
+            "annotator_id": "ann_2",
+        },
+        {
+            "article_id": "art_consensus",
+            "commodity": "gold",
+            "true_relevance_class": "directly_relevant",
+            "true_sentiment_label": "neutral",
+            "true_event_type": "other",
+            "true_event_impact_direction": "unknown",
+            "annotator_id": "ann_2",
+        },
+    ]
+
+    out_gt = tmp_path / "final_ground_truth.jsonl"
+    merge_summary = adjudicator.merge_adjudicated_ground_truth(
+        primary_records=primary_records,
+        secondary_records=secondary_records,
+        adjudicated_records=adjudicated_records,
+        output_jsonl_path=out_gt,
+        overwrite=True,
+    )
+
+    assert merge_summary["total_merged_records"] == 3
+    assert merge_summary["primary_unshared_count"] == 1
+    assert merge_summary["consensus_accepted_count"] == 1
+    assert merge_summary["adjudicated_resolved_count"] == 1
+    assert out_gt.exists()
+
+    # Inspect merged contents
+    merged = load_annotation_records(out_gt)
+    m_by_id = {r["article_id"]: r for r in merged}
+    assert m_by_id["art_conflict"]["true_event_type"] == "supply_disruption"
+    assert "adj:expert_01" in m_by_id["art_conflict"]["annotator_id"]
+    assert "consensus" in m_by_id["art_consensus"]["annotator_id"]
+    assert m_by_id["art_unshared"]["annotator_id"] == "ann_1"
+
+
+def test_load_annotation_records_csv_and_jsonl(tmp_path):
+    """load_annotation_records handles both JSONL and CSV with formula desanitization."""
+    csv_path = tmp_path / "formula_test.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["commodity", "article_title", "article_url"])
+        writer.writeheader()
+        writer.writerow({
+            "commodity": "copper",
+            "article_title": "'+5% copper rally",
+            "article_url": "https://example.com/1",
+        })
+
+    records = load_annotation_records(csv_path)
+    assert len(records) == 1
+    # Leading formula quote stripped cleanly
+    assert records[0]["article_title"] == "+5% copper rally"
+
+
+def test_cli_package_and_agreement_modes(tmp_path):
+    """CLI runner successfully executes 'package', 'agreement', and 'adjudicate' modes."""
+    # 1. Prepare sample
+    sample_path = tmp_path / "sample.jsonl"
+    sample_records = [
+        {
+            "commodity": "copper",
+            "article_url": f"https://example.com/c/{i}",
+            "article_title": f"Copper article {i}",
+            "article_publication_timestamp": "2026-11-01T10:00:00Z",
+        }
+        for i in range(10)
+    ]
+    with open(sample_path, "w", encoding="utf-8") as f:
+        for r in sample_records:
+            f.write(json.dumps(r) + "\n")
+
+    pkg_dir = tmp_path / "cli_packages"
+    exit_code_pkg = run_cli([
+        "--mode", "package",
+        "--input", str(sample_path),
+        "--output-dir", str(pkg_dir),
+        "--overlap-fraction", "0.20",
+    ])
+    assert exit_code_pkg == 0
+    p_jsonl = pkg_dir / "annotation_package_primary.jsonl"
+    s_jsonl = pkg_dir / "annotation_package_secondary.jsonl"
+    assert p_jsonl.exists()
+    assert s_jsonl.exists()
+
+    # 2. Test agreement CLI mode
+    report_path = tmp_path / "audit_report.json"
+    template_path = tmp_path / "adj_template.csv"
+    exit_code_agr = run_cli([
+        "--mode", "agreement",
+        "--primary", str(p_jsonl),
+        "--secondary", str(s_jsonl),
+        "--output", str(report_path),
+        "--adjudication-template", str(template_path),
+    ])
+    assert exit_code_agr == 0
+    assert report_path.exists()
+    assert template_path.exists()
+
+
+def test_cohens_kappa_partial_agreement_and_class_imbalance():
+    """Cohen's Kappa with class imbalance and partial agreement matches manual calculation."""
+    y1 = ["positive", "positive", "positive", "positive", "positive", "positive", "negative", "negative", "neutral", "neutral"]
+    y2 = ["positive", "positive", "positive", "positive", "positive", "negative", "negative", "negative", "neutral", "neutral"]
+    # P_o = 0.90, P_e = 0.40 -> Kappa = 0.50 / 0.60 = 0.8333
+    kappa = compute_cohens_kappa(y1, y2, categories=["positive", "negative", "neutral"])
+    assert kappa is not None
+    assert abs(kappa - 0.8333) < 1e-3
+    assert interpret_cohens_kappa(kappa) == "almost_perfect_agreement"
+
+
+def test_cohens_kappa_degenerate_constant_labels_is_none():
+    """When both raters assign the exact same single category, Kappa is mathematically undefined (0/0)."""
+    y1 = ["positive"] * 10
+    y2 = ["positive"] * 10
+    kappa = compute_cohens_kappa(y1, y2, categories=["positive", "negative", "neutral"])
+    assert kappa is None
+    assert interpret_cohens_kappa(kappa) == "undefined_constant_distribution"
+
+
+def test_annotation_agreement_auditor_missing_invalid_labels_and_sample_warning():
+    """Auditor excludes invalid/missing labels from Kappa, reports them, and flags small sample warning."""
+    primary = [
+        {"article_id": "art_1", "commodity": "copper", "true_relevance_class": "directly_relevant", "true_sentiment_label": "positive", "true_event_type": "supply_disruption", "true_event_impact_direction": "potentially_bullish", "annotator_id": "p1"},
+        {"article_id": "art_2", "commodity": "copper", "true_relevance_class": "invalid_relevance", "true_sentiment_label": "positive", "true_event_type": "supply_disruption", "true_event_impact_direction": "potentially_bullish", "annotator_id": "p1"},
+    ]
+    secondary = [
+        {"article_id": "art_1", "commodity": "copper", "true_relevance_class": "directly_relevant", "true_sentiment_label": "positive", "true_event_type": "supply_disruption", "true_event_impact_direction": "potentially_bullish", "annotator_id": "s1"},
+        {"article_id": "art_2", "commodity": "copper", "true_relevance_class": "directly_relevant", "true_sentiment_label": "positive", "true_event_type": "supply_disruption", "true_event_impact_direction": "potentially_bullish", "annotator_id": "s1"},
+    ]
+
+    auditor = AnnotationAgreementAuditor()
+    report = auditor.audit(primary, secondary)
+
+    # art_2 had invalid_relevance in primary -> excluded from paired relevance calculation
+    rel_task = report["task_agreements"]["relevance"]
+    assert rel_task["valid_paired_evaluations"] == 1
+    assert rel_task["missing_or_invalid_count"] == 1
+    assert len(rel_task["missing_or_invalid_samples"]) == 1
+
+    # Small sample warning triggered (N=2 < 30)
+    assert report["audit_metadata"]["sample_size_warning"] is not None
+    assert "Small overlap sample size" in report["audit_metadata"]["sample_size_warning"]
+
+    # Per-label agreement exists
+    assert "directly_relevant" in rel_task["per_label_agreement"]
+
+
+def test_annotation_agreement_auditor_flags_duplicates_and_cross_commodity():
+    """Auditor flags duplicate records in primary/secondary and prevents cross-commodity shared URL mixing."""
+    primary = [
+        {"article_id": "id_1", "commodity": "copper", "article_url": "https://example.com/shared", "true_relevance_class": "directly_relevant", "true_sentiment_label": "positive", "true_event_type": "supply_disruption", "true_event_impact_direction": "potentially_bullish"},
+        # Duplicate in primary
+        {"article_id": "id_1", "commodity": "copper", "article_url": "https://example.com/shared", "true_relevance_class": "directly_relevant", "true_sentiment_label": "positive", "true_event_type": "supply_disruption", "true_event_impact_direction": "potentially_bullish"},
+    ]
+    secondary = [
+        # Secondary has same URL but commodity is gold (cross-commodity shared URL)
+        {"article_id": "id_diff", "commodity": "gold", "article_url": "https://example.com/shared", "true_relevance_class": "directly_relevant", "true_sentiment_label": "positive", "true_event_type": "supply_disruption", "true_event_impact_direction": "potentially_bullish"},
+    ]
+
+    auditor = AnnotationAgreementAuditor()
+    report = auditor.audit(primary, secondary)
+
+    assert report["audit_metadata"]["duplicate_primary_records_count"] == 1
+    # Cross-commodity record is not matched with copper primary record
+    assert report["audit_metadata"]["matched_overlapping_records"] == 0
+    assert report["audit_metadata"]["unmatched_secondary_records"] == 1
+
+
+def test_merge_adjudicated_ground_truth_safety_rejections(tmp_path):
+    """Adjudicator strictly rejects all unsafe/incomplete conditions."""
+    adjudicator = AnnotationAdjudicator()
+
+    primary = [{
+        "article_id": "art_1", "commodity": "copper", "article_url": "https://example.com/1", "article_title": "Title 1",
+        "true_relevance_class": "directly_relevant", "true_sentiment_label": "positive", "true_event_type": "supply_disruption", "true_event_impact_direction": "potentially_bullish", "annotator_id": "ann1"
+    }]
+    secondary = [{
+        "article_id": "art_1", "commodity": "copper",
+        "true_relevance_class": "directly_relevant", "true_sentiment_label": "negative",  # DISPUTE on sentiment!
+        "true_event_type": "supply_disruption", "true_event_impact_direction": "potentially_bullish", "annotator_id": "ann2"
+    }]
+
+    # 1. Unresolved disagreement (no adjudication record) -> MUST RAISE
+    with pytest.raises(ValueError, match="Unresolved disagreement"):
+        adjudicator.merge_adjudicated_ground_truth(primary, secondary, adjudicated_records=None)
+
+    # 2. Incomplete adjudication (adjudicated field left blank) -> MUST RAISE
+    adj_blank = [{"article_id": "art_1", "adjudicator_id": "exp1", "adjudicated_sentiment": ""}]
+    with pytest.raises(ValueError, match="Incomplete adjudication"):
+        adjudicator.merge_adjudicated_ground_truth(primary, secondary, adjudicated_records=adj_blank)
+
+    # 3. Missing adjudicator_id -> MUST RAISE
+    adj_no_id = [{"article_id": "art_1", "adjudicator_id": "", "adjudicated_sentiment": "positive"}]
+    with pytest.raises(ValueError, match="Missing adjudicator_id"):
+        adjudicator.merge_adjudicated_ground_truth(primary, secondary, adjudicated_records=adj_no_id)
+
+    # 4. Invalid adjudicated taxonomy -> MUST RAISE
+    adj_invalid_tax = [{"article_id": "art_1", "adjudicator_id": "exp1", "adjudicated_sentiment": "super_positive"}]
+    with pytest.raises(ValueError, match="Invalid adjudicated value"):
+        adjudicator.merge_adjudicated_ground_truth(primary, secondary, adjudicated_records=adj_invalid_tax)
+
+    # 5. Duplicate adjudication records -> MUST RAISE
+    adj_dup = [
+        {"article_id": "art_1", "adjudicator_id": "exp1", "adjudicated_sentiment": "positive"},
+        {"article_id": "art_1", "adjudicator_id": "exp2", "adjudicated_sentiment": "negative"},
+    ]
+    with pytest.raises(ValueError, match="Duplicate adjudication record"):
+        adjudicator.merge_adjudicated_ground_truth(primary, secondary, adjudicated_records=adj_dup)
+
+    # 6. Unknown article_id in adjudication -> MUST RAISE
+    adj_unknown = [
+        {"article_id": "art_1", "adjudicator_id": "exp1", "adjudicated_sentiment": "positive"},
+        {"article_id": "nonexistent_id", "adjudicator_id": "exp1", "adjudicated_sentiment": "positive"},
+    ]
+    with pytest.raises(ValueError, match="Unknown article_id"):
+        adjudicator.merge_adjudicated_ground_truth(primary, secondary, adjudicated_records=adj_unknown)
+
+    # 7. Incomplete primary record (missing core label in primary) -> MUST RAISE
+    primary_incomplete = [{
+        "article_id": "art_1", "commodity": "copper", "article_url": "https://example.com/1", "article_title": "Title 1",
+        "true_relevance_class": "directly_relevant", "true_sentiment_label": "", "true_event_type": "supply_disruption", "true_event_impact_direction": "potentially_bullish", "annotator_id": "ann1"
+    }]
+    with pytest.raises(ValueError, match="Incomplete ground truth"):
+        adjudicator.merge_adjudicated_ground_truth(primary_incomplete)
+
+    # 8. Overwrite existing file without overwrite=True -> MUST RAISE
+    out_file = tmp_path / "existing.jsonl"
+    out_file.write_text('{"existing": true}\n', encoding="utf-8")
+    adj_valid = [{"article_id": "art_1", "adjudicator_id": "exp1", "adjudicated_sentiment": "positive"}]
+    with pytest.raises(FileExistsError, match="already exists"):
+        adjudicator.merge_adjudicated_ground_truth(primary, secondary, adjudicated_records=adj_valid, output_jsonl_path=out_file, overwrite=False)
+
+
+def test_merge_adjudicated_ground_truth_field_isolation_and_provenance(tmp_path):
+    """Adjudicated resolution applies strictly to disputed field; agreed fields retain consensus."""
+    adjudicator = AnnotationAdjudicator()
+
+    primary = [{
+        "article_id": "art_1", "commodity": "copper", "article_url": "https://example.com/1", "article_title": "Copper mine accident",
+        "true_relevance_class": "directly_relevant", "true_sentiment_label": "negative",
+        "true_event_type": "supply_disruption", "true_event_impact_direction": "potentially_bullish",
+        "annotator_id": "lead_rater"
+    }]
+    secondary = [{
+        "article_id": "art_1", "commodity": "copper",
+        "true_relevance_class": "directly_relevant", "true_sentiment_label": "negative",
+        "true_event_type": "other",  # Disputed!
+        "true_event_impact_direction": "potentially_bullish",
+        "annotator_id": "second_rater"
+    }]
+    adjudication = [{
+        "article_id": "art_1", "adjudicator_id": "domain_expert",
+        "adjudicated_event_type": "supply_disruption",  # Resolved!
+        "adjudication_notes": "Mine accidents halting production are supply disruptions."
+    }]
+
+    out_file = tmp_path / "merged_gt.jsonl"
+    summary = adjudicator.merge_adjudicated_ground_truth(
+        primary_records=primary,
+        secondary_records=secondary,
+        adjudicated_records=adjudication,
+        output_jsonl_path=out_file,
+    )
+    assert summary["adjudicated_resolved_count"] == 1
+    assert summary["total_merged_records"] == 1
+
+    records = load_annotation_records(out_file)
+    rec = records[0]
+    assert rec["true_event_type"] == "supply_disruption"
+    assert rec["true_sentiment_label"] == "negative"
+    assert rec["true_relevance_class"] == "directly_relevant"
+    assert rec["true_event_impact_direction"] == "potentially_bullish"
+    assert rec["annotator_id"] == "lead_rater+second_rater[adj:domain_expert]"
+    assert "Mine accidents halting production" in rec["annotator_notes"]
+
+
+def test_e2e_full_human_workflow_synthetic_fixtures(tmp_path):
+    """
+    End-to-End simulation of the full 9-step human workflow using isolated synthetic fixtures:
+    1. Generate primary & secondary packages.
+    2. Populate independent synthetic human labels.
+    3. Import completed CSVs.
+    4. Compute inter-annotator agreement & Cohen's Kappa.
+    5. Detect disagreements.
+    6. Generate adjudication template.
+    7. Simulate human expert resolution.
+    8. Merge final verified ground truth.
+    9. Run supervised evaluation pipeline against synthetic model features.
+    """
+    from src.evaluation.evaluator import NLPEvaluationPipeline
+
+    # Step 1: Create synthetic sample of 50 articles (40 oil, 5 copper, 5 gold)
+    raw_sample = tmp_path / "synthetic_sample.jsonl"
+    records = []
+    for i in range(5):
+        records.append({"commodity": "copper", "article_url": f"https://example.com/c/{i}", "article_title": f"Copper news {i}", "article_publication_timestamp": "2026-11-01T10:00:00Z"})
+    for i in range(5):
+        records.append({"commodity": "gold", "article_url": f"https://example.com/g/{i}", "article_title": f"Gold news {i}", "article_publication_timestamp": "2026-11-01T10:00:00Z"})
+    for i in range(40):
+        records.append({"commodity": "crude oil", "article_url": f"https://example.com/o/{i}", "article_title": f"Oil news {i}", "article_publication_timestamp": "2026-11-01T10:00:00Z"})
+    with open(raw_sample, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+    pkg_dir = tmp_path / "workflow_packages"
+    pkg_res = prepare_pilot_annotation_packages(raw_sample, output_dir=pkg_dir, overlap_fraction=0.20, seed=42)
+    assert pkg_res["primary_count"] == 50
+    assert pkg_res["secondary_count"] == 10
+
+    # Step 2: Populate synthetic human annotations
+    p_csv = Path(pkg_res["files_generated"]["primary_csv"])
+    s_csv = Path(pkg_res["files_generated"]["secondary_csv"])
+
+    p_rows = load_annotation_records(p_csv)
+    s_rows = load_annotation_records(s_csv)
+
+    for r in p_rows:
+        r["true_relevance_class"] = "directly_relevant"
+        r["true_sentiment_label"] = "positive"
+        r["true_event_type"] = "production_change"
+        r["true_event_impact_direction"] = "potentially_bearish"
+        r["annotator_id"] = "primary_human"
+
+    for idx, r in enumerate(s_rows):
+        r["true_relevance_class"] = "directly_relevant"
+        # Introduce deliberate dispute on 2 articles for sentiment and event_type
+        if idx in (0, 1):
+            r["true_sentiment_label"] = "negative"
+            r["true_event_type"] = "supply_disruption"
+        else:
+            r["true_sentiment_label"] = "positive"
+            r["true_event_type"] = "production_change"
+        r["true_event_impact_direction"] = "potentially_bearish"
+        r["annotator_id"] = "secondary_human"
+
+    # Step 3: Save to CSV and Import with strict validation
+    completed_p_csv = tmp_path / "completed_primary.csv"
+    completed_s_csv = tmp_path / "completed_secondary.csv"
+    with open(completed_p_csv, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(p_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(p_rows)
+    with open(completed_s_csv, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(s_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(s_rows)
+
+    importer = AnnotationCSVImporter()
+    p_gt_jsonl = tmp_path / "imported_primary.jsonl"
+    s_gt_jsonl = tmp_path / "imported_secondary.jsonl"
+    importer.import_csv(completed_p_csv, output_jsonl_path=p_gt_jsonl, strict=True)
+    importer.import_csv(completed_s_csv, output_jsonl_path=s_gt_jsonl, strict=True)
+
+    imported_p = load_annotation_records(p_gt_jsonl)
+    imported_s = load_annotation_records(s_gt_jsonl)
+
+    # Step 4 & 5: Compute Agreement and Detect Disagreements
+    auditor = AnnotationAgreementAuditor()
+    audit_report = auditor.audit(imported_p, imported_s)
+    assert audit_report["audit_metadata"]["matched_overlapping_records"] == 10
+    assert audit_report["audit_metadata"]["total_records_with_disagreements"] == 2
+    assert len(audit_report["disagreements"]) == 2
+
+    # Step 6: Generate Adjudication Template
+    adjudicator = AnnotationAdjudicator()
+    adj_template_csv = tmp_path / "adjudication_template.csv"
+    template_rows = adjudicator.create_adjudication_template(audit_report, output_csv_path=adj_template_csv)
+    assert len(template_rows) == 2
+    assert all(r["adjudicated_sentiment"] == "" for r in template_rows)
+
+    # Step 7: Simulate Human Expert Resolution
+    adjudicated_records = []
+    for r in template_rows:
+        adjudicated_records.append({
+            "article_id": r["article_id"],
+            "adjudicator_id": "senior_quant",
+            "adjudicated_sentiment": "negative",
+            "adjudicated_event_type": "supply_disruption",
+            "adjudication_notes": "Expert resolved conflict based on supply reduction.",
+        })
+
+    # Step 8: Merge Final Verified Ground Truth
+    final_gt_jsonl = tmp_path / "final_verified_ground_truth.jsonl"
+    merge_summary = adjudicator.merge_adjudicated_ground_truth(
+        primary_records=imported_p,
+        secondary_records=imported_s,
+        adjudicated_records=adjudicated_records,
+        output_jsonl_path=final_gt_jsonl,
+        strict=True,
+    )
+    assert merge_summary["total_merged_records"] == 50
+    assert merge_summary["adjudicated_resolved_count"] == 2
+    assert merge_summary["consensus_accepted_count"] == 8
+    assert merge_summary["primary_unshared_count"] == 40
+    assert final_gt_jsonl.exists()
+
+    # Step 9: Evaluate Supervised Classification against Synthetic Predictions
+    # Create synthetic feature predictions corresponding to the 50 articles
+    synthetic_features = []
+    for r in imported_p:
+        synthetic_features.append({
+            "article_id": r["article_id"],
+            "commodity": r["commodity"],
+            "article_url": r["article_url"],
+            "article_title": r["article_title"],
+            "article_publication_timestamp": r["article_publication_timestamp"],
+            "relevance_class": "directly_relevant",
+            "relevance_score": 0.95,
+            "finbert_sentiment_label": "positive",
+            "finbert_sentiment_score": 0.88,
+            "supply_chain_event_type": "production_change",
+            "event_confidence": 0.90,
+            "event_impact_direction": "potentially_bearish",
+            "feature_pipeline_status": "complete",
+        })
+
+    pipeline = NLPEvaluationPipeline()
+    final_gt_records = load_annotation_records(final_gt_jsonl)
+    eval_report = pipeline.run(feature_records=synthetic_features, labeled_records=final_gt_records)
+
+    assert eval_report["evaluation_metadata"]["supervised_evaluation_available"] is True
+    assert eval_report["evaluation_metadata"]["total_labeled_records"] == 50
+    assert eval_report["evaluation_metadata"]["unmatched_ground_truth_count"] == 0
+    assert eval_report["relevance_evaluation"]["sample_count"] == 50
+    assert eval_report["event_extraction_evaluation"]["sample_count"] == 50
+    assert eval_report["sentiment_evaluation"]["supervised_evaluation"]["sample_count"] == 50
+    assert eval_report["sentiment_evaluation"]["supervised_evaluation"]["status"] == "evaluated"

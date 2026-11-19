@@ -11,10 +11,19 @@ Usage:
     python run_evaluation.py --mode sample --sample-size 50 --seed 42
     python run_evaluation.py --mode sample --input data/processed/nlp_article_features.jsonl --output data/evaluation/annotation_sample.jsonl
 
-    # 3. Import and validate completed human annotations from CSV to JSONL
+    # 3. Prepare multi-annotator packages (primary + 20% overlap secondary + manifest)
+    python run_evaluation.py --mode package --input data/evaluation/annotation_sample.jsonl --output-dir data/evaluation/
+
+    # 4. Import and validate completed human annotations from CSV to JSONL
     python run_evaluation.py --mode import-csv --input data/evaluation/annotation_sample.csv --output data/evaluation/human_ground_truth.jsonl
 
-    # 4. Evaluate supervised classification against human-labeled ground truth
+    # 5. Inter-annotator agreement audit and Cohen's Kappa calculation
+    python run_evaluation.py --mode agreement --primary data/evaluation/human_ground_truth_primary.jsonl --secondary data/evaluation/human_ground_truth_secondary.jsonl --adjudication-template data/evaluation/adjudication_template.csv
+
+    # 6. Merge consensus annotations and human-adjudicated resolutions into final ground truth
+    python run_evaluation.py --mode adjudicate --primary data/evaluation/human_ground_truth_primary.jsonl --secondary data/evaluation/human_ground_truth_secondary.jsonl --adjudicated data/evaluation/adjudication_template.csv --output data/evaluation/human_ground_truth.jsonl
+
+    # 7. Evaluate supervised classification against human-labeled ground truth
     python run_evaluation.py --mode evaluate --ground-truth data/evaluation/human_ground_truth.jsonl
     python run_evaluation.py --mode evaluate --input data/processed/nlp_article_features.jsonl --ground-truth data/evaluation/human_ground_truth.jsonl
 

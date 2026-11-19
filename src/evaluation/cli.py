@@ -17,7 +17,16 @@ from src.features.builder import load_jsonl_records
 from src.features.aggregator import parse_timestamp_utc
 from src.evaluation.config import EvaluationConfig
 from src.evaluation.data_quality import DataQualityValidator
-from src.evaluation.annotation import generate_annotation_sample, AnnotationCSVImporter
+from src.evaluation.annotation import (
+    generate_annotation_sample,
+    AnnotationCSVImporter,
+    prepare_pilot_annotation_packages,
+)
+from src.evaluation.quality_control import (
+    AnnotationAgreementAuditor,
+    AnnotationAdjudicator,
+    load_annotation_records,
+)
 from src.evaluation.evaluator import NLPEvaluationPipeline
 
 logger = logging.getLogger("nlp_evaluation")
@@ -213,6 +222,60 @@ def _format_csv_import_summary(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_agreement_summary(report: Dict[str, Any]) -> str:
+    meta = report.get("audit_metadata", {})
+    tasks = report.get("task_agreements", {})
+    disagreements = report.get("disagreements", [])
+
+    lines = []
+    lines.append(f"Audit Timestamp:              {meta.get('audit_timestamp', '')}")
+    lines.append(f"Primary Records:              {meta.get('total_primary_records', 0)}")
+    lines.append(f"Secondary Records:            {meta.get('total_secondary_records', 0)}")
+    lines.append(f"Matched Overlapping Records:  {meta.get('matched_overlapping_records', 0)}")
+    lines.append(f"Unmatched Secondary Records:  {meta.get('unmatched_secondary_records', 0)}")
+    lines.append(f"Duplicate Primary Records:    {meta.get('duplicate_primary_records_count', 0)}")
+    lines.append(f"Duplicate Secondary Records:  {meta.get('duplicate_secondary_records_count', 0)}")
+    lines.append(f"Records with Disagreements:   {meta.get('total_records_with_disagreements', 0)}")
+
+    if meta.get("sample_size_warning"):
+        lines.append("-" * 70)
+        lines.append(f"SAMPLE SIZE WARNING: {meta.get('sample_size_warning')}")
+
+    lines.append("-" * 70)
+    lines.append("Inter-Annotator Agreement by Task:")
+    lines.append(f"  {'Task':<18s} {'Valid Pairs':<12s} {'Agreed':<8s} {'Obs Rate':<10s} {'Cohen Kappa':<14s} {'Interpretation'}")
+    for task_name, m in tasks.items():
+        evaluated = m.get("valid_paired_evaluations", 0)
+        agreed = m.get("agreed_records", 0)
+        obs_rate = f"{m.get('observed_agreement_rate', 0.0) * 100:.1f}%"
+        kappa_val = m.get("cohens_kappa")
+        kappa_str = f"{kappa_val:.4f}" if kappa_val is not None else "Undefined (0/0)"
+        interp = m.get("interpretation", "")
+        lines.append(f"  {task_name:<18s} {evaluated:<12d} {agreed:<8d} {obs_rate:<10s} {kappa_str:<14s} {interp}")
+
+        # Show missing/invalid if any
+        miss_cnt = m.get("missing_or_invalid_count", 0)
+        if miss_cnt > 0:
+            lines.append(f"    └── Missing/Invalid annotations: {miss_cnt}")
+
+    lines.append("-" * 70)
+    lines.append("Statistical Note: Landis-Koch benchmarks are descriptive heuristics, not proof of annotation reliability.")
+
+    if disagreements:
+        lines.append("-" * 70)
+        lines.append(f"Itemized Disagreements ({len(disagreements)} articles):")
+        for d in disagreements[:5]:
+            lines.append(f"  • [{d.get('commodity')}] ID: {d.get('article_id')}")
+            lines.append(f"    Title: {str(d.get('article_title', ''))[:60]}...")
+            for fld in d.get("disagreed_fields", []):
+                vals = d.get("field_values", {}).get(fld, {})
+                lines.append(f"    Field '{fld}': Primary='{vals.get('primary')}' vs Secondary='{vals.get('secondary')}'")
+        if len(disagreements) > 5:
+            lines.append(f"  ... and {len(disagreements) - 5} more articles with disagreements.")
+
+    return "\n".join(lines)
+
+
 def run_cli(args: Optional[List[str]] = None) -> int:
     """Main CLI runner parsing arguments and delegating to evaluation components."""
     parser = argparse.ArgumentParser(
@@ -221,9 +284,9 @@ def run_cli(args: Optional[List[str]] = None) -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["validate", "sample", "evaluate", "import-csv"],
+        choices=["validate", "sample", "evaluate", "import-csv", "package", "agreement", "adjudicate"],
         default="validate",
-        help="Operational mode: 'validate' data quality, 'sample' for annotation, 'evaluate' labeled data, 'import-csv' to convert annotated CSV.",
+        help="Operational mode: 'validate' data quality, 'sample' for annotation, 'evaluate' labeled data, 'import-csv' to convert annotated CSV, 'package' to generate multi-annotator packages, 'agreement' to compute Cohen's kappa, 'adjudicate' to merge adjudicated ground truth.",
     )
     parser.add_argument(
         "--input",
@@ -242,6 +305,42 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         type=Path,
         default=None,
         help="Path to output report (JSON), sample template (JSONL), or converted ground truth (JSONL).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("data/evaluation"),
+        help="Directory destination for generated packages or reports (used in 'package' mode).",
+    )
+    parser.add_argument(
+        "--primary",
+        type=Path,
+        default=None,
+        help="Path to primary annotation file (CSV or JSONL).",
+    )
+    parser.add_argument(
+        "--secondary",
+        type=Path,
+        default=None,
+        help="Path to secondary annotation file (CSV or JSONL).",
+    )
+    parser.add_argument(
+        "--adjudicated",
+        type=Path,
+        default=None,
+        help="Path to completed human adjudication file (CSV or JSONL).",
+    )
+    parser.add_argument(
+        "--adjudication-template",
+        type=Path,
+        default=None,
+        help="Path to export human adjudication spreadsheet template (CSV).",
+    )
+    parser.add_argument(
+        "--overlap-fraction",
+        type=float,
+        default=0.20,
+        help="Fraction of articles to overlap between annotators (default: 0.20).",
     )
     parser.add_argument(
         "--cutoff",
@@ -383,6 +482,104 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         print(_format_csv_import_summary(report))
         print("-" * 70)
         print(f"Converted {report['valid_records_count']} ground-truth records saved to: {output_path}")
+        return 0
+
+    # 5. Mode: Human Annotation Packages Generation
+    elif parsed.mode == "package":
+        _print_banner(f"Generate Human Annotation Packages: {parsed.input}")
+        if not parsed.input.exists():
+            print(f"Error: Input sample file '{parsed.input}' does not exist.")
+            return 1
+
+        output_dir = parsed.output_dir or Path("data/evaluation")
+        try:
+            res = prepare_pilot_annotation_packages(
+                sample_path=parsed.input,
+                output_dir=output_dir,
+                overlap_fraction=parsed.overlap_fraction,
+                seed=parsed.seed,
+            )
+        except Exception as e:
+            print(f"Error: Packaging failed: {e}")
+            return 1
+
+        print(f"Primary Package:   {res['primary_count']} articles")
+        print(f"Secondary Package: {res['secondary_count']} articles ({int(parsed.overlap_fraction * 100)}% overlap)")
+        print(f"Overlap Articles:  {res['overlap_count']}")
+        print(f"Commodity Breakdown (Overlap): {res['commodity_breakdown']['secondary']}")
+        print("-" * 70)
+        print("Generated Files:")
+        for k, v in res["files_generated"].items():
+            print(f"  • {k:16s}: {v}")
+        return 0
+
+    # 6. Mode: Inter-Annotator Agreement Audit
+    elif parsed.mode == "agreement":
+        _print_banner("Inter-Annotator Agreement Audit")
+        p_path = parsed.primary or (parsed.input if parsed.primary is None and parsed.secondary is not None else None)
+        s_path = parsed.secondary
+        if not p_path or not p_path.exists():
+            print(f"Error: Primary annotations file '{p_path}' does not exist. Use --primary <path>.")
+            return 1
+        if not s_path or not s_path.exists():
+            print(f"Error: Secondary annotations file '{s_path}' does not exist. Use --secondary <path>.")
+            return 1
+
+        try:
+            primary_records = load_annotation_records(p_path)
+            secondary_records = load_annotation_records(s_path)
+            auditor = AnnotationAgreementAuditor()
+            report = auditor.audit(primary_records, secondary_records)
+        except Exception as e:
+            print(f"Error: Agreement audit failed: {e}")
+            return 1
+
+        output_path = parsed.output or Path("data/evaluation/agreement_report.json")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+
+        if parsed.adjudication_template:
+            adj_p = Path(parsed.adjudication_template)
+            adjudicator = AnnotationAdjudicator()
+            adjudicator.create_adjudication_template(report, output_csv_path=adj_p)
+            print(f"Adjudication template exported to: {adj_p}")
+
+        print(_format_agreement_summary(report))
+        print("-" * 70)
+        print(f"Full agreement report saved to: {output_path}")
+        return 0
+
+    # 7. Mode: Merge Human Adjudicated Ground Truth
+    elif parsed.mode == "adjudicate":
+        _print_banner("Merge Human Adjudicated Ground Truth")
+        p_path = parsed.primary or parsed.input
+        if not p_path or not p_path.exists():
+            print(f"Error: Primary annotations file '{p_path}' does not exist. Use --primary <path>.")
+            return 1
+
+        try:
+            primary_records = load_annotation_records(p_path)
+            secondary_records = load_annotation_records(parsed.secondary) if parsed.secondary and parsed.secondary.exists() else None
+            adjudicated_records = load_annotation_records(parsed.adjudicated) if parsed.adjudicated and parsed.adjudicated.exists() else None
+
+            adjudicator = AnnotationAdjudicator()
+            output_path = parsed.output or Path("data/evaluation/human_ground_truth.jsonl")
+            summary = adjudicator.merge_adjudicated_ground_truth(
+                primary_records=primary_records,
+                secondary_records=secondary_records,
+                adjudicated_records=adjudicated_records,
+                output_jsonl_path=output_path,
+                overwrite=parsed.overwrite,
+            )
+        except Exception as e:
+            print(f"Error: Adjudication merge failed: {e}")
+            return 1
+
+        print(f"Merged {summary['total_merged_records']} records into: {output_path}")
+        print(f"  • Primary Unshared:    {summary['primary_unshared_count']}")
+        print(f"  • Consensus Accepted:  {summary['consensus_accepted_count']}")
+        print(f"  • Adjudicated Resolved: {summary['adjudicated_resolved_count']}")
         return 0
 
     return 0

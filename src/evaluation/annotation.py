@@ -6,7 +6,7 @@ news or feature datasets. Eliminates model prediction leakage to ensure objectiv
 human ground-truth evaluation.
 """
 
-from collections import Counter
+from collections import Counter, defaultdict
 import csv
 from datetime import datetime, timezone
 import hashlib
@@ -265,6 +265,132 @@ To guarantee reliable ground-truth datasets for scientific and operational evalu
 
 ### Formula Injection Safety Notice:
 When CSV files are exported, any text starting with formula execution characters (`=`, `+`, `-`, `@`, `\t`, `\r`) is automatically escaped with a leading single quote (`'`) to protect spreadsheet software against DDE/CSV formula injection attacks. The import pipeline automatically strips this escaping prefix when converting back to JSONL, ensuring the underlying article title, URL, and deterministic ID match 100% without data corruption.
+"""
+
+ANNOTATION_INSTRUCTIONS: str = """# Human Annotation Instructions: Commodity News Intelligence Pilot
+
+Welcome to the pilot annotation process for the **AI-Powered Commodity Price Prediction and Supply-Chain Intelligence** platform.
+
+This document provides concise, practical instructions for annotating commodity news articles to produce high-integrity human ground truth for evaluating our NLP pipeline.
+
+---
+
+## 1. Package Structure & File Locations
+
+All annotation files are stored in `data/evaluation/`:
+
+| File | Purpose | Target Audience |
+| :--- | :--- | :--- |
+| `annotation_package_primary.csv` | Full pilot dataset (50 articles: 40 crude oil, 5 copper, 5 gold) | Primary Annotator |
+| `annotation_package_primary.jsonl` | Programmatic JSONL format of primary package | Automation / Reference |
+| `annotation_package_secondary.csv` | 20% stratified overlap sample (10 articles: 6 crude oil, 2 copper, 2 gold) | Secondary Annotator |
+| `annotation_package_secondary.jsonl` | Programmatic JSONL format of secondary package | Automation / Reference |
+| `annotation_manifest.csv` | Cross-package tracking and overlap assignment manifest | Auditor / Coordinator |
+| `ANNOTATION_GUIDELINES.md` | Comprehensive taxonomy reference and edge-case criteria | All Annotators |
+
+---
+
+## 2. Spreadsheet Setup & Editing Rules
+
+### Opening in Microsoft Excel or Google Sheets:
+1. Open `annotation_package_primary.csv` (or `annotation_package_secondary.csv`) directly in Excel, LibreOffice Calc, or Google Sheets.
+2. The file is encoded in **UTF-8 with BOM (`utf-8-sig`)**, ensuring special characters and accents render properly.
+3. Cells beginning with mathematical symbols (`=`, `+`, `-`, `@`) have been automatically escaped with a leading single quote (`'`) to protect against spreadsheet formula execution. **Do not remove this prefix.**
+
+### Preserving Data Integrity:
+> [!IMPORTANT]
+> - **DO NOT alter or sort by** `article_id`, `commodity`, `article_url`, or `article_publication_timestamp`.
+> - **DO NOT insert or delete rows or columns.**
+> - **ONLY enter data** into the 6 designated human annotation columns.
+> - **Save as CSV UTF-8** when finished (Excel: `File -> Save As -> CSV UTF-8 (Comma delimited) (*.csv)`).
+
+---
+
+## 3. Required Fields & Allowed Taxonomies
+
+Fill every row with values from the exact taxonomies below (all lowercase, exact spelling):
+
+### Column 1: `true_relevance_class`
+*Does this headline describe physical supply, logistics, demand, pricing, or relevant macro drivers for the commodity?*
+
+- **`directly_relevant`**: Directly discusses physical commodity markets, prices, production, mining, refining, inventories, or trading (e.g., *"LME copper inventories decline"*, *"OPEC+ extends 2.2mbpd crude cuts"*).
+- **`potentially_relevant`**: Broader macroeconomic or geopolitical events that strongly impact commodity demand/prices (e.g., *"Fed lowers benchmark interest rate by 50 bps"*, *"China manufacturing PMI contracts"*).
+- **`irrelevant`**: Homonyms, sports, entertainment, figurative language, or unrelated businesses (e.g., *"Runner takes Olympic gold"*, *"Copper Mountain ski pass"*, *"Comedian's crude joke"*).
+- **`uncertain`**: Incomplete, truncated, or clickbait headlines where content cannot be determined from the title alone.
+
+---
+
+### Column 2: `true_sentiment_label`
+*What is the emotional, operational, or business tone of the headline itself?*
+
+- **`positive`**: Commercial success, operational triumphs, output records, profit expansion, safety achievements.
+- **`negative`**: Accidents, disasters, strikes, explosions, sanctions, lawsuits, bankruptcies, cost blowouts.
+- **`neutral`**: Factual market reports, routine statistics, balanced commentary, or ambiguous polarity.
+
+---
+
+### Column 3: `true_event_type`
+*What physical supply-chain or industrial event occurred?*
+
+- **`supply_disruption`**: Force majeure, pipeline ruptures, refinery fires, mine collapses, labor strikes, export embargoes.
+- **`demand_change`**: Industrial manufacturing booms, sudden factory shutdowns, consumer fuel shifts, stockpiling demand.
+- **`inventory_change`**: Official stockpile builds or draws (e.g. EIA crude inventories, LME copper warehouse stocks).
+- **`geopolitical_risk`**: Armed conflicts, shipping canal blockades (Red Sea/Panama Canal), international sanctions, military threats.
+- **`production_change`**: New mine/oilfield discoveries, OPEC quota decisions, capacity expansions, routine maintenance shutdowns.
+- **`policy_action`**: Export tariffs, windfall taxes, environmental permits, mining concessions, strategic reserve releases.
+- **`other`**: General price commentary, stock market reports, financial analyses, or articles with no specific physical event.
+
+---
+
+### Column 4: `true_event_impact_direction`
+*What is the expected theoretical microeconomic impact on commodity prices?*
+
+- **`potentially_bullish`**: Supply restrictions, stockpile depletion, demand expansion, or transit disruption (tends to drive prices **up**).
+- **`potentially_bearish`**: Supply gluts, stockpile accumulation, demand contraction, or production booms (tends to drive prices **down**).
+- **`mixed`**: Conflicting economic forces present in the headline (e.g. "OPEC raises quotas but Russian pipeline offline; markets weigh supply balance").
+- **`unknown`**: Used when event type is `other`, article is `irrelevant` or `uncertain`, or no directional supply/demand mechanism exists.
+
+> [!WARNING]
+> **Sentiment != Price Impact!**
+> A mine disaster or refinery fire is **`negative`** news sentiment, but curtails physical supply, resulting in a **`potentially_bullish`** price impact. Always evaluate sentiment and price impact independently.
+
+---
+
+### Column 5: `annotator_id`
+Enter your unique identifier (e.g., `annotator_01`, `expert_lead`). Keep this consistent across all rows.
+
+### Column 6: `annotator_notes`
+(Optional) Note any ambiguity, edge case considerations, or rationale for difficult calls.
+
+---
+
+## 4. Verification & Submission Workflow
+
+Once annotation is complete:
+
+1. **Save CSV**: Save your spreadsheet as `annotation_package_primary.csv` (or `annotation_package_secondary.csv`).
+2. **Validate & Convert to JSONL**:
+   ```bash
+   python run_evaluation.py --mode import-csv --input data/evaluation/annotation_package_primary.csv --output data/evaluation/human_ground_truth_primary.jsonl --strict
+   ```
+   *Strict mode verifies all values match allowed taxonomies, no rows were duplicated, and all IDs match.*
+
+3. **Inter-Annotator Agreement Audit (Coordinator Step)**:
+   ```bash
+   python run_evaluation.py --mode agreement --primary data/evaluation/human_ground_truth_primary.jsonl --secondary data/evaluation/human_ground_truth_secondary.jsonl --adjudication-template data/evaluation/adjudication_template.csv
+   ```
+   *Computes observed agreement % and Cohen's Kappa across all 4 tasks, and exports conflicting items to `adjudication_template.csv` for human resolution.*
+
+4. **Human Adjudication & Consensus Ground Truth**:
+   Senior domain expert fills `adjudication_template.csv`, then merges the final ground truth:
+   ```bash
+   python run_evaluation.py --mode adjudicate --primary data/evaluation/human_ground_truth_primary.jsonl --secondary data/evaluation/human_ground_truth_secondary.jsonl --adjudicated data/evaluation/adjudication_template.csv --output data/evaluation/human_ground_truth.jsonl
+   ```
+
+5. **Empirical Model Evaluation**:
+   ```bash
+   python run_evaluation.py --mode evaluate --input data/processed/nlp_article_features.jsonl --ground-truth data/evaluation/human_ground_truth.jsonl
+   ```
 """
 
 
@@ -914,3 +1040,213 @@ def convert_annotated_csv_to_jsonl(
         overwrite=overwrite,
         strict=strict,
     )
+
+
+def prepare_pilot_annotation_packages(
+    sample_path: Path = Path("data/evaluation/annotation_sample.jsonl"),
+    output_dir: Path = Path("data/evaluation"),
+    overlap_fraction: float = 0.20,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """
+    Generate independent human annotation packages for primary and secondary annotators
+    along with a deterministic assignment manifest.
+
+    1. Primary Package: All 50 pilot articles (blank labels).
+       Output: annotation_package_primary.csv and annotation_package_primary.jsonl
+    2. Secondary Package: Deterministic 20% overlapping sample (10 articles balanced across commodities).
+       Output: annotation_package_secondary.csv and annotation_package_secondary.jsonl
+    3. Assignment Manifest: Explicit tracking of article assignments and overlap status.
+       Output: annotation_manifest.json and annotation_manifest.csv
+    """
+    sample_path = Path(sample_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    records = load_jsonl_records(sample_path)
+    if not records:
+        raise ValueError(f"Annotation sample file '{sample_path}' contains no records.")
+
+    # 1. Primary Package: Clean copy of all records with blank human-label fields
+    primary_records: List[Dict[str, Any]] = []
+    for r in records:
+        comm = str(r.get("commodity") or "").strip().lower()
+        url = canonicalize_url(r.get("article_url") or r.get("url") or "")
+        art_id = str(r.get("article_id") or _generate_deterministic_id(comm, url)).strip()
+
+        item = {
+            "article_id": art_id,
+            "commodity": comm,
+            "article_url": url,
+            "article_title": str(r.get("article_title") or r.get("title") or "").strip(),
+            "article_publication_timestamp": r.get("article_publication_timestamp") or None,
+            "domain": str(r.get("domain") or "").strip(),
+            "language": str(r.get("language") or "unknown").strip(),
+            "source_country": r.get("source_country") or None,
+            "true_relevance_class": "",
+            "true_sentiment_label": "",
+            "true_event_type": "",
+            "true_event_impact_direction": "",
+            "annotator_id": "",
+            "annotator_notes": "",
+        }
+        primary_records.append(item)
+
+    # 2. Secondary Package: Deterministic 20% overlapping sample (stratified across commodities)
+    by_comm: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in primary_records:
+        by_comm[r["commodity"]].append(r)
+
+    total_target = max(1, int(round(len(primary_records) * overlap_fraction)))
+    rng = random.Random(seed)
+
+    # Calculate stratified commodity overlap quotas:
+    # 1. Guarantee minimum representation floor per commodity so all commodities
+    #    are audited for agreement (min(len(pool), 2) when quota permits).
+    # 2. Allocate remaining quota proportionally according to commodity pool sizes.
+    allocated_quotas: Dict[str, int] = {}
+    active_comms = sorted(list(by_comm.keys()))
+
+    min_floor = 2 if total_target >= len(active_comms) * 2 else 1
+    for comm in active_comms:
+        allocated_quotas[comm] = min(len(by_comm[comm]), min_floor)
+
+    remaining_needed = total_target - sum(allocated_quotas.values())
+    if remaining_needed > 0:
+        rem_pool = {comm: len(by_comm[comm]) - allocated_quotas[comm] for comm in active_comms}
+        tot_rem = sum(rem_pool.values())
+        if tot_rem > 0:
+            # Largest remainder method for fair proportional allocation
+            quotas_float = {comm: (rem_pool[comm] / tot_rem) * remaining_needed for comm in active_comms}
+            quotas_int = {comm: int(quotas_float[comm]) for comm in active_comms}
+            rem_to_distribute = remaining_needed - sum(quotas_int.values())
+
+            # Sort by fractional part descending
+            sorted_by_frac = sorted(
+                active_comms,
+                key=lambda c: (quotas_float[c] - quotas_int[c], rem_pool[c]),
+                reverse=True,
+            )
+            for i in range(rem_to_distribute):
+                c = sorted_by_frac[i % len(sorted_by_frac)]
+                quotas_int[c] += 1
+
+            for comm in active_comms:
+                allocated_quotas[comm] += min(quotas_int[comm], rem_pool[comm])
+
+    secondary_records: List[Dict[str, Any]] = []
+    for comm in active_comms:
+        pool = list(by_comm[comm])
+        rng.shuffle(pool)
+        quota = allocated_quotas.get(comm, 0)
+        for rec in pool[:quota]:
+            secondary_records.append(dict(rec))
+
+    rng.shuffle(secondary_records)
+    secondary_ids = {r["article_id"] for r in secondary_records}
+
+    # 3. Build Assignment Manifest
+    manifest_rows: List[Dict[str, Any]] = []
+    for r in primary_records:
+        aid = r["article_id"]
+        is_overlap = aid in secondary_ids
+        assigned = "primary,secondary" if is_overlap else "primary"
+        manifest_rows.append({
+            "article_id": aid,
+            "commodity": r["commodity"],
+            "article_title": r["article_title"],
+            "article_url": r["article_url"],
+            "article_publication_timestamp": r["article_publication_timestamp"],
+            "domain": r["domain"],
+            "is_overlap": is_overlap,
+            "assigned_annotators": assigned,
+        })
+
+    # File paths
+    p_jsonl = output_dir / "annotation_package_primary.jsonl"
+    p_csv = output_dir / "annotation_package_primary.csv"
+    s_jsonl = output_dir / "annotation_package_secondary.jsonl"
+    s_csv = output_dir / "annotation_package_secondary.csv"
+    m_json = output_dir / "annotation_manifest.json"
+    m_csv = output_dir / "annotation_manifest.csv"
+
+    fieldnames = list(primary_records[0].keys())
+
+    # Write Primary Package
+    with open(p_jsonl, "w", encoding="utf-8") as f:
+        for r in primary_records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    with open(p_csv, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in primary_records:
+            writer.writerow({k: sanitize_for_spreadsheet(v) for k, v in r.items()})
+
+    # Write Secondary Package
+    with open(s_jsonl, "w", encoding="utf-8") as f:
+        for r in secondary_records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    with open(s_csv, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in secondary_records:
+            writer.writerow({k: sanitize_for_spreadsheet(v) for k, v in r.items()})
+
+    # Write Manifest
+    manifest_data = {
+        "metadata": {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source_sample": str(sample_path),
+            "seed": seed,
+            "total_articles": len(primary_records),
+            "primary_count": len(primary_records),
+            "secondary_count": len(secondary_records),
+            "overlap_count": len(secondary_ids),
+            "overlap_rate": round(len(secondary_ids) / len(primary_records), 4),
+            "commodity_overlap_breakdown": dict(Counter(r["commodity"] for r in secondary_records)),
+        },
+        "articles": manifest_rows,
+    }
+    with open(m_json, "w", encoding="utf-8") as f:
+        json.dump(manifest_data, f, indent=2, ensure_ascii=False)
+
+    m_fieldnames = list(manifest_rows[0].keys())
+    with open(m_csv, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=m_fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in manifest_rows:
+            writer.writerow({k: sanitize_for_spreadsheet(v) for k, v in r.items()})
+
+    # Write Accompanying Instructions and Guidelines
+    instr_path = output_dir / "ANNOTATION_INSTRUCTIONS.md"
+    with open(instr_path, "w", encoding="utf-8") as f:
+        f.write(ANNOTATION_INSTRUCTIONS)
+
+    guide_path = output_dir / "ANNOTATION_GUIDELINES.md"
+    with open(guide_path, "w", encoding="utf-8") as f:
+        f.write(ANNOTATION_GUIDELINES)
+
+    logger.info("Generated annotation packages, instructions, and manifest in %s", output_dir)
+
+    return {
+        "status": "success",
+        "primary_count": len(primary_records),
+        "secondary_count": len(secondary_records),
+        "overlap_count": len(secondary_ids),
+        "commodity_breakdown": {
+            "primary": dict(Counter(r["commodity"] for r in primary_records)),
+            "secondary": dict(Counter(r["commodity"] for r in secondary_records)),
+        },
+        "files_generated": {
+            "primary_jsonl": str(p_jsonl),
+            "primary_csv": str(p_csv),
+            "secondary_jsonl": str(s_jsonl),
+            "secondary_csv": str(s_csv),
+            "manifest_json": str(m_json),
+            "manifest_csv": str(m_csv),
+            "instructions_markdown": str(instr_path),
+            "guidelines_markdown": str(guide_path),
+        },
+    }
