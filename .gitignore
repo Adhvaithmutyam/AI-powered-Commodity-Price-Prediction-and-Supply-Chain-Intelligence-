@@ -25,3 +25,13 @@ pection.txt
 # OS files
 .DS_Store
 Thumbs.db
+
+# Generated datasets - keep locally, do not commit
+data/raw/
+data/processed/
+data/validated/
+data/features/
+
+# Generated reports and temporary inspection files
+inspection.txt
+*inspection*.txt
