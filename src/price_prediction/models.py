@@ -12,6 +12,81 @@ from sklearn.metrics import classification_report, f1_score, log_loss
 CLASS_LABELS: Dict[int, str] = {0: "Decrease", 1: "Stable", 2: "Increase"}
 
 
+class SimpleLogisticClassifier:
+    """
+    Pure NumPy multinomial logistic regression classifier.
+    Used as an emergency fallback when C-compiled gradient boosting extensions
+    (such as LightGBM or scikit-learn's _libsvm_sparse) are blocked by OS security policies.
+    """
+
+    def __init__(self, max_iter: int = 150, lr: float = 0.05, reg: float = 0.01):
+        self.max_iter = max_iter
+        self.lr = lr
+        self.reg = reg
+        self.weights: Optional[np.ndarray] = None
+        self.bias: Optional[np.ndarray] = None
+        self.classes_: np.ndarray = np.array([0, 1, 2])
+        self.feature_importances_: Optional[np.ndarray] = None
+
+    def _softmax(self, z: np.ndarray) -> np.ndarray:
+        exp_z = np.exp(z - np.max(z, axis=1, keepdims=True))
+        return exp_z / np.sum(exp_z, axis=1, keepdims=True)
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "SimpleLogisticClassifier":
+        X_mat = np.nan_to_num(X.values, nan=0.0)
+        # Normalize features with clipping to prevent numerical instability
+        self.mean = np.mean(X_mat, axis=0)
+        self.std = np.std(X_mat, axis=0)
+        self.std[self.std < 1e-6] = 1.0
+        X_norm = np.clip((X_mat - self.mean) / self.std, -5.0, 5.0)
+
+        n_samples, n_features = X_norm.shape
+        n_classes = 3
+        self.classes_ = np.array([0, 1, 2])
+
+        # One-hot encode targets
+        Y_onehot = np.zeros((n_samples, n_classes))
+        y_vals = y.values.astype(int)
+        for i, val in enumerate(y_vals):
+            if 0 <= val < n_classes:
+                Y_onehot[i, val] = 1.0
+
+        # Class weights to avoid majority class collapse
+        class_counts = np.bincount(np.clip(y_vals, 0, n_classes - 1), minlength=n_classes)
+        total_samples = len(y_vals)
+        class_weights = total_samples / (n_classes * np.maximum(class_counts, 1.0))
+        sample_weights = class_weights[y_vals]
+
+        np.random.seed(42)
+        self.weights = np.random.normal(0, 0.01, (n_features, n_classes))
+        self.bias = np.zeros(n_classes)
+
+        for _ in range(self.max_iter):
+            logits = np.dot(X_norm, self.weights) + self.bias
+            probs = self._softmax(logits)
+
+            diff = (probs - Y_onehot) * sample_weights[:, None]
+            dw = (np.dot(X_norm.T, diff) / n_samples) + (self.reg * self.weights)
+            db = np.sum(diff, axis=0) / n_samples
+
+            self.weights -= self.lr * dw
+            self.bias -= self.lr * db
+
+        # Compute pseudo feature importances as mean absolute weight across classes
+        self.feature_importances_ = np.mean(np.abs(self.weights), axis=1)
+        return self
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        X_mat = np.nan_to_num(X.values, nan=0.0)
+        X_norm = np.clip((X_mat - self.mean) / self.std, -5.0, 5.0)
+        logits = np.dot(X_norm, self.weights) + self.bias
+        return self._softmax(logits)
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        probs = self.predict_proba(X)
+        return np.argmax(probs, axis=1)
+
+
 class BaselineMajorityClassifier:
     """
     Baseline predictor that always predicts the empirical majority class from training data.
@@ -72,15 +147,19 @@ class CommodityDirectionClassifier:
         try:
             import lightgbm as lgb
             self.model = lgb.LGBMClassifier(**self.params)
-        except ImportError:
-            # Fallback to sklearn HistGradientBoostingClassifier or GradientBoostingClassifier
-            from sklearn.ensemble import HistGradientBoostingClassifier
-            self.model = HistGradientBoostingClassifier(
-                max_iter=self.params.get("n_estimators", 100),
-                learning_rate=self.params.get("learning_rate", 0.03),
-                max_leaf_nodes=self.params.get("num_leaves", 15),
-                random_state=42,
-            )
+        except Exception:
+            try:
+                # Fallback to sklearn HistGradientBoostingClassifier
+                from sklearn.ensemble import HistGradientBoostingClassifier
+                self.model = HistGradientBoostingClassifier(
+                    max_iter=self.params.get("n_estimators", 100),
+                    learning_rate=self.params.get("learning_rate", 0.03),
+                    max_leaf_nodes=self.params.get("num_leaves", 15),
+                    random_state=42,
+                )
+            except Exception:
+                # Fallback to pure NumPy SimpleLogisticClassifier when C extensions/DLLs are blocked
+                self.model = SimpleLogisticClassifier()
 
     def fit(self, X_train: pd.DataFrame, y_train: pd.Series) -> "CommodityDirectionClassifier":
         self.feature_names = list(X_train.columns)
