@@ -87,6 +87,46 @@ class SimpleLogisticClassifier:
         return np.argmax(probs, axis=1)
 
 
+class PlattCalibrator:
+    """
+    Multiclass probability calibration using vector/temperature scaling (Platt scaling extension).
+    Fits temperature parameters over raw probabilities or logits to minimize cross-entropy loss.
+    """
+
+    def __init__(self, n_classes: int = 3):
+        self.n_classes = n_classes
+        self.temperature: float = 1.0
+
+    def fit(self, raw_probs: np.ndarray, y_true: pd.Series) -> "PlattCalibrator":
+        eps = 1e-7
+        clipped = np.clip(raw_probs, eps, 1.0 - eps)
+        logits = np.log(clipped)
+
+        y_arr = y_true.values.astype(int)
+        best_loss = float("inf")
+        best_temp = 1.0
+
+        for t in np.linspace(0.5, 3.0, 50):
+            scaled_logits = logits / t
+            exp_z = np.exp(scaled_logits - np.max(scaled_logits, axis=1, keepdims=True))
+            probs = exp_z / np.sum(exp_z, axis=1, keepdims=True)
+            loss = -np.mean(np.log(probs[np.arange(len(y_arr)), y_arr] + eps))
+            if loss < best_loss:
+                best_loss = loss
+                best_temp = t
+
+        self.temperature = best_temp
+        return self
+
+    def calibrate(self, raw_probs: np.ndarray) -> np.ndarray:
+        eps = 1e-7
+        clipped = np.clip(raw_probs, eps, 1.0 - eps)
+        logits = np.log(clipped)
+        scaled_logits = logits / self.temperature
+        exp_z = np.exp(scaled_logits - np.max(scaled_logits, axis=1, keepdims=True))
+        return exp_z / np.sum(exp_z, axis=1, keepdims=True)
+
+
 class BaselineMajorityClassifier:
     """
     Baseline predictor that always predicts the empirical majority class from training data.
