@@ -91,7 +91,7 @@ def test_validate_macro_records():
 def test_save_and_load_macro_records(tmp_path, monkeypatch):
     import src.data_engineering.macroeconomic.storage as storage
 
-    monkeypatch.setattr(storage, "MACRO_DATA_DIR", tmp_path)
+    monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
     records = [normalize_macro_record(sample_record())]
 
     file_path = save_macro_records(records, "USA", "gdp_growth")

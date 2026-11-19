@@ -31,7 +31,8 @@ class MacroeconomicPipeline:
         valid_path = save_macro_records(
             valid_records,
             country_code,
-            indicator_name
+            indicator_name,
+            validated=True
         )
 
         invalid_path = None
